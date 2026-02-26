@@ -1,0 +1,45 @@
+[package]
+name = "dynamo-kv-router-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+
+[dependencies.dynamo-kv-router]
+path = ".."
+features = ["metrics"]
+
+# Prevent cargo-fuzz from being pulled into the workspace
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_radix_tree_events"
+path = "fuzz_targets/fuzz_radix_tree_events.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_block_hash_computation"
+path = "fuzz_targets/fuzz_block_hash_computation.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_kv_protocol_json"
+path = "fuzz_targets/fuzz_kv_protocol_json.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_positional_indexer"
+path = "fuzz_targets/fuzz_positional_indexer.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_request_extra_info"
+path = "fuzz_targets/fuzz_request_extra_info.rs"
+doc = false
