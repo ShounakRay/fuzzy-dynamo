@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use super::super::ToolDefinition;
 use super::super::config::XmlParserConfig;
+use super::super::utils::{chunk_ends_with_token_prefix, decode_xml_entities};
 use super::response::{CalledFunction, ToolCallResponse, ToolCallType};
 
 /// Strip surrounding quotes from a string if present
@@ -38,13 +39,7 @@ pub fn detect_tool_call_start_xml(chunk: &str, config: &XmlParserConfig) -> bool
     }
 
     // Check for partial match at the end of the chunk (for streaming).
-    for i in 1..start_token.len() {
-        if chunk.ends_with(&start_token[..i]) {
-            return true;
-        }
-    }
-
-    false
+    chunk_ends_with_token_prefix(chunk, start_token)
 }
 
 /// Find the end position of a Qwen3Coder tool call.
@@ -323,8 +318,8 @@ fn convert_param_value(
     param_config: &HashMap<String, Value>,
     func_name: &str,
 ) -> Value {
-    // HTML unescape and trim
-    let param_value = html_unescape(param_value.trim());
+    // XML/HTML entity decode and trim
+    let param_value = decode_xml_entities(param_value.trim());
 
     // Handle null
     if param_value.to_lowercase() == "null" {
@@ -507,8 +502,8 @@ fn try_literal_eval(s: &str) -> Result<Value, ()> {
 /// NOTE: This function is deprecated and kept for reference. Use convert_param_value instead.
 #[allow(dead_code)]
 fn safe_parse_value(raw: &str) -> serde_json::Value {
-    // HTML unescape
-    let unescaped = html_unescape(raw.trim());
+    // XML/HTML entity decode
+    let unescaped = decode_xml_entities(raw.trim());
 
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&unescaped) {
         return value;
@@ -533,16 +528,6 @@ fn safe_parse_value(raw: &str) -> serde_json::Value {
 
     // Default to string, stripping newlines from start and end.
     serde_json::Value::String(unescaped.trim_matches('\n').to_string())
-}
-
-/// Simple HTML unescape for common entities.
-fn html_unescape(s: &str) -> String {
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&#x27;", "'")
-        .replace("&#39;", "'")
 }
 
 #[cfg(test)]
@@ -597,7 +582,7 @@ mod tests {
     #[case("a &amp; b", "a & b", "ampersand")]
     #[case("&quot;quoted&quot;", "\"quoted\"", "quotes")]
     fn test_html_unescape(#[case] input: &str, #[case] expected: &str, #[case] _description: &str) {
-        assert_eq!(html_unescape(input), expected);
+        assert_eq!(crate::tool_calling::utils::decode_xml_entities(input), expected);
     }
 
     #[test]
@@ -922,6 +907,72 @@ rust programming
         assert_eq!(args["float_param"], "not_a_float");
         // bool_param with invalid value defaults to false
         assert_eq!(args["bool_param"], false);
+    }
+
+    #[test]
+    #[should_panic(expected = "begin <= end")]
+    fn test_strip_quotes_panics_on_single_quote_char() {
+        // BUG: strip_quotes does &trimmed[1..trimmed.len()-1] which panics when
+        // trimmed is a single quote character (len=1 → slice [1..0]).
+        // starts_with('"') and ends_with('"') both return true for "\"",
+        // but trimmed[1..0] has begin > end, causing a panic.
+        let _ = strip_quotes("\"");
+    }
+
+    #[test]
+    fn test_strip_quotes_single_quote_char_should_not_panic() {
+        // Guard test: strip_quotes should handle a lone quote gracefully
+        // (return empty string), not panic.
+        let result = std::panic::catch_unwind(|| strip_quotes("\""));
+        assert!(
+            result.is_ok(),
+            "strip_quotes panics on single quote char input"
+        );
+    }
+
+    #[test]
+    fn test_detect_tool_call_start_xml_with_unicode_start_token() {
+        // Previously panicked due to byte-based slicing on multibyte UTF-8 tokens.
+        // Fixed by using character-based iteration via chunk_ends_with_token_prefix().
+        let config = XmlParserConfig {
+            tool_call_start_token: "<\u{5DE5}\u{5177}>".to_string(), // "<工具>" in Chinese
+            ..Default::default()
+        };
+        assert!(detect_tool_call_start_xml("partial <\u{5DE5}", &config));
+    }
+
+    #[test]
+    fn test_try_literal_eval_corrupts_true_in_string_values() {
+        // BUG: .replace("True", "true") is global, corrupting string values
+        // containing "True" as a substring. E.g., "TrueNorth" → "trueNorth"
+        let input = "{'location': 'TrueNorth'}";
+        let result = try_literal_eval(input).unwrap();
+        assert_eq!(
+            result["location"], "TrueNorth",
+            "try_literal_eval corrupts 'TrueNorth' to 'trueNorth' via global .replace()"
+        );
+    }
+
+    #[test]
+    fn test_try_literal_eval_corrupts_false_in_string_values() {
+        // Same bug with "False" → "false"
+        let input = "{'label': 'Falsehood'}";
+        let result = try_literal_eval(input).unwrap();
+        assert_eq!(
+            result["label"], "Falsehood",
+            "try_literal_eval corrupts 'Falsehood' to 'falsehood' via global .replace()"
+        );
+    }
+
+    #[test]
+    fn test_try_literal_eval_corrupts_none_in_string_values() {
+        // Same bug with "None" → "null"
+        let input = "{'status': 'NoneAvailable'}";
+        let result = try_literal_eval(input).unwrap();
+        assert_eq!(
+            result["status"], "NoneAvailable",
+            "try_literal_eval corrupts 'NoneAvailable' to 'nullAvailable' via global .replace()"
+        );
     }
 
     #[test]

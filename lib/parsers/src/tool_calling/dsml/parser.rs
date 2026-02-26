@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use super::super::config::DsmlParserConfig;
 use super::super::response::{CalledFunction, ToolCallResponse, ToolCallType};
+use super::super::utils::chunk_ends_with_token_prefix;
 
 /// DeepSeek V3.2 uses DSML (DeepSeek Markup Language) format for tool calls:
 ///
@@ -28,15 +29,7 @@ pub fn detect_tool_call_start_dsml(chunk: &str, config: &DsmlParserConfig) -> bo
     }
 
     // Check for partial match at the end (streaming scenario)
-    let start_chars: Vec<char> = start_token.chars().collect();
-    for i in 1..start_chars.len() {
-        let partial: String = start_chars[..i].iter().collect();
-        if chunk.ends_with(&partial) {
-            return true;
-        }
-    }
-
-    false
+    chunk_ends_with_token_prefix(chunk, start_token)
 }
 
 /// Find the end position of a DSML tool call block
@@ -473,6 +466,47 @@ mod tests {
 
         let (_, args) = extract_name_and_args(calls[0].clone());
         assert_eq!(args["empty"], "");
+    }
+
+    #[test]
+    fn test_parse_parameter_with_capitalized_string_attr() {
+        // BUG: The regex requires exactly string="true" or string="false" (lowercase).
+        // If the model emits string="True" (capitalized), the parameter is silently dropped.
+        let input = r#"<｜DSML｜function_calls>
+<｜DSML｜invoke name="test">
+<｜DSML｜parameter name="query" string="True">hello world</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜function_calls>"#;
+
+        let config = get_test_config();
+        let (calls, _) = try_tool_call_parse_dsml(input, &config).unwrap();
+        assert_eq!(calls.len(), 1, "Tool call should be parsed");
+
+        let (_, args) = extract_name_and_args(calls[0].clone());
+        assert_eq!(
+            args["query"], "hello world",
+            "Parameter with string=\"True\" (capitalized) is silently dropped"
+        );
+    }
+
+    #[test]
+    fn test_parse_parameter_without_string_attr() {
+        // BUG: If the model omits the string attribute entirely, the parameter is dropped.
+        let input = r#"<｜DSML｜function_calls>
+<｜DSML｜invoke name="test">
+<｜DSML｜parameter name="value">42</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜function_calls>"#;
+
+        let config = get_test_config();
+        let (calls, _) = try_tool_call_parse_dsml(input, &config).unwrap();
+        assert_eq!(calls.len(), 1, "Tool call should be parsed");
+
+        let (_, args) = extract_name_and_args(calls[0].clone());
+        assert!(
+            args.get("value").is_some(),
+            "Parameter without string attribute is silently dropped"
+        );
     }
 
     #[test]

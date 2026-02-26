@@ -13,6 +13,7 @@ pub mod response;
 #[cfg(test)]
 pub mod tests;
 pub mod tools;
+pub mod utils;
 pub mod xml;
 
 /// Represents a tool definition with function schema.

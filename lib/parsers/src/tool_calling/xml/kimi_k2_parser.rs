@@ -11,6 +11,7 @@ use regex::Regex;
 
 use super::super::ToolDefinition;
 use super::super::config::KimiK2ParserConfig;
+use super::super::utils::chunk_ends_with_token_prefix;
 use super::response::{CalledFunction, ToolCallResponse, ToolCallType};
 
 static ID_REGEX: OnceLock<Regex> = OnceLock::new();
@@ -46,21 +47,14 @@ fn get_id_regex() -> &'static Regex {
 /// Detects `<|tool_calls_section_begin|>` (or singular variant) or partial match for streaming.
 pub fn detect_tool_call_start_kimi_k2(chunk: &str, config: &KimiK2ParserConfig) -> bool {
     for start_token in &config.section_start_variants {
-        debug_assert!(
-            start_token.is_ascii(),
-            "Kimi K2 section tokens must be ASCII for safe byte slicing, got: {start_token:?}"
-        );
-
         // Check for complete start token.
         if chunk.contains(start_token.as_str()) {
             return true;
         }
 
         // Check for partial match at the end of the chunk (for streaming).
-        for i in 1..start_token.len() {
-            if chunk.ends_with(&start_token[..i]) {
-                return true;
-            }
+        if chunk_ends_with_token_prefix(chunk, start_token) {
+            return true;
         }
     }
 
@@ -636,6 +630,48 @@ mod tests {
         assert_eq!(args["name"], "John Doe");
         assert_eq!(args["address"]["city"], "Springfield");
         assert_eq!(args["tags"], serde_json::json!(["admin", "active"]));
+    }
+
+    #[test]
+    fn test_oncelock_regex_depends_on_config_but_cached_statically() {
+        // BUG: get_tool_call_regex() takes a &KimiK2ParserConfig parameter and
+        // builds the regex from config.call_start, config.argument_begin, and
+        // config.call_end. However, the result is stored in a static OnceLock,
+        // so only the FIRST call's config is used. Subsequent calls with
+        // different config values silently use the stale cached regex.
+        //
+        // This test demonstrates the issue: parsing with default config works,
+        // but parsing with a custom config that uses different tokens would
+        // silently use the cached regex from the default config.
+        let default_config = default_config();
+        let default_input = r#"<|tool_calls_section_begin|><|tool_call_begin|>functions.test:0<|tool_call_argument_begin|>{"key":"val"}<|tool_call_end|><|tool_calls_section_end|>"#;
+
+        // This works fine with default config
+        let (calls, _) =
+            try_tool_call_parse_kimi_k2(default_input, &default_config, None).unwrap();
+        assert_eq!(calls.len(), 1);
+
+        // Now try with a hypothetical custom config using different tokens.
+        // Due to OnceLock caching, the regex compiled from default tokens is
+        // reused, so these custom tokens won't actually be matched.
+        let custom_config = KimiK2ParserConfig {
+            call_start: "[CALL_START]".to_string(),
+            argument_begin: "[ARGS]".to_string(),
+            call_end: "[CALL_END]".to_string(),
+            ..default_config.clone()
+        };
+        let custom_input =
+            r#"<|tool_calls_section_begin|>[CALL_START]functions.test:0[ARGS]{"key":"val"}[CALL_END]<|tool_calls_section_end|>"#;
+
+        let (calls, _) =
+            try_tool_call_parse_kimi_k2(custom_input, &custom_config, None).unwrap();
+        // BUG: This returns 0 calls because the static regex was compiled with
+        // the default config's tokens, not the custom config's tokens.
+        assert_eq!(
+            calls.len(),
+            1,
+            "OnceLock caches regex from first config; custom config tokens are ignored"
+        );
     }
 
     #[test]
