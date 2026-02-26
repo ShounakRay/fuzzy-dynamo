@@ -4,6 +4,14 @@
 
 Comprehensive fuzzing infrastructure covering 5 crates with 27 fuzz targets and 4 regression test modules (79 tests). Found **7 confirmed crash bugs via fuzzing** and **14 bugs via code audit** across 4 crates. All crash bugs are reproducible with minimal inputs.
 
+**Audit Verdicts** (after reviewing source code, tests, and documentation):
+
+| Verdict | Bugs | Count |
+|---------|------|-------|
+| Confirmed real bug | 3, 4, 6, 7, 8, 9, 11, 14, 15, 16, 17, 18, 20 | 13 |
+| Debatable (trade-off) | 5, 10, 19 | 3 |
+| Already fixed upstream | 12, 13 | 2 |
+
 **Fuzzer-Confirmed Crashes:**
 
 | # | Crate | Crash Type | Severity | How Found |
@@ -12,7 +20,7 @@ Comprehensive fuzzing infrastructure covering 5 crates with 27 fuzz targets and 
 | 16 | kv-router | RefCell reentrant borrow | High | Fuzzing |
 | 17 | kv-router | Division by zero | High | Fuzzing |
 | 18 | runtime | Integer overflow (add) | Critical | Fuzzing (predicted by audit) |
-| 19 | parsers | Differential: MiniMax trim | Low | Fuzzing |
+| 19 | parsers | Differential: MiniMax trim | Low (debatable) | Fuzzing |
 | 20 | parsers | Differential: Mistral prefix | Medium | Fuzzing (predicted by audit) |
 
 ---
@@ -198,10 +206,11 @@ let total_len = 24usize
 
 ---
 
-### Bug 19: MiniMaxAppendThink differential — whitespace-only reasoning lost
+### Bug 19: MiniMaxAppendThink differential — whitespace-only reasoning lost *(debatable)*
 
 **Severity**: Low — cosmetic whitespace difference
 **How found**: Fuzzing (`fuzz_differential`)
+**Verdict**: Debatable — the streaming path cannot trim mid-stream since more data may follow. Streaming and one-shot have legitimately different contracts regarding trailing whitespace. This is a conscious trade-off rather than a bug.
 **File**: `lib/parsers/src/reasoning/minimax_append_think_parser.rs` (via `BasicReasoningParser` in `base_parser.rs` lines 139-140 vs 253-254)
 **Crash artifact**: `lib/parsers/fuzz/artifacts/fuzz_differential/crash-3f3d2d8955322f325af6db2238355fa07007ebd9`
 
@@ -305,10 +314,11 @@ if !self.stripped_think_start
 
 ---
 
-### Bug 2: `.trim()` asymmetry between one-shot and streaming
+### Bug 2: `.trim()` asymmetry between one-shot and streaming *(debatable)*
 
 **Severity**: Low
 **How found**: Code audit (later confirmed by fuzzing as Bug 19)
+**Verdict**: Debatable — same as Bug 19. Streaming cannot trim mid-stream.
 **File**: `lib/parsers/src/reasoning/base_parser.rs`, lines 139-140 vs 253-254
 
 **What it is**: Same as Bug 19 above. One-shot applies `.trim()` to both reasoning and normal text; streaming does not.
@@ -364,10 +374,11 @@ let result = try_tool_call_parse_dsml(input, &DsmlParserConfig::default());
 
 ---
 
-### Bug 5: DeepSeek V3 JSON normalization destroys newlines
+### Bug 5: DeepSeek V3 JSON normalization destroys newlines *(debatable)*
 
 **Severity**: Medium
 **How found**: Code audit
+**Verdict**: Debatable — this normalization is a deliberate recovery path for malformed JSON. The newline destruction is a trade-off: joining with `"\n"` preserves string newlines but could break JSON repair for certain malformed inputs.
 **File**: `lib/parsers/src/tool_calling/json/deepseek_v3_parser.rs`, lines 115-119
 
 **What it is**: When initial JSON parsing of tool call arguments fails, the fallback normalization joins all lines with spaces:
@@ -499,10 +510,11 @@ Text after the tool call end token is completely lost. Same class as Bug 6.
 
 ---
 
-### Bug 10: Kimi K2 OnceLock caches regex for first config only
+### Bug 10: Kimi K2 OnceLock caches regex for first config only *(debatable)*
 
 **Severity**: Low — likely benign in practice
 **How found**: Code audit
+**Verdict**: Debatable — currently benign because only one `KimiK2ParserConfig` exists in practice. The API signature creates a false contract (accepts `&config` but ignores it after first call), but the actual impact is zero unless a second config is introduced.
 **File**: `lib/parsers/src/tool_calling/xml/kimi_k2_parser.rs`, lines 26-36
 
 **What it is**: The regex is built from the config parameter but stored in a static `OnceLock`:
@@ -555,31 +567,23 @@ let result = strip_quotes("'");   // panics: range 1..0
 
 ---
 
-### Bug 12: `detect_tool_call_start_xml` panics on multibyte UTF-8 start tokens
+### Bug 12: `detect_tool_call_start_xml` panics on multibyte UTF-8 start tokens *(already fixed)*
 
-**Severity**: High — crash with non-ASCII config
+**Severity**: ~~High~~ N/A — already fixed
 **How found**: Code audit
+**Verdict**: **Already fixed.** The shared utility `chunk_ends_with_token_prefix()` was refactored to use character-based iteration instead of byte slicing. Existing regression tests confirm the fix with positive assertions (not `#[should_panic]`) and comments: "Previously panicked... Fixed by using character-based iteration."
 **File**: `lib/parsers/src/tool_calling/xml/parser.rs`, line 42
 
-**What it is**: `chunk_ends_with_token_prefix()` uses byte-based slicing internally for prefix matching. When the start token contains multibyte UTF-8 characters (common in CJK-based model formats), the slice may land in the middle of a character, panicking with `byte index N is not a char boundary`.
-
-Currently latent because the default XML config uses ASCII tokens (`<tool_call>`), but would crash if a custom config used a Unicode start token.
-
-**How to reproduce**: Call `detect_tool_call_start_xml` with an `XmlParserConfig` whose `tool_call_start_token` contains multibyte characters, and a `chunk` whose suffix partially overlaps the token at a non-char-boundary.
-
-**How to fix**: Use character-based iteration in `chunk_ends_with_token_prefix()` instead of byte slicing.
+**What it was**: `chunk_ends_with_token_prefix()` used byte-based slicing internally for prefix matching. When the start token contained multibyte UTF-8 characters, the slice could land in the middle of a character. This has been resolved.
 
 ---
 
-### Bug 13: `detect_tool_call_start_glm47` same UTF-8 panic
+### Bug 13: `detect_tool_call_start_glm47` same UTF-8 panic *(already fixed)*
 
-**Severity**: High — crash with non-ASCII config
+**Severity**: ~~High~~ N/A — already fixed
 **How found**: Code audit
+**Verdict**: **Already fixed.** Same fix as Bug 12 — both call the shared `chunk_ends_with_token_prefix()` which now uses character-based iteration.
 **File**: `lib/parsers/src/tool_calling/xml/glm47_parser.rs`, line 30
-
-**What it is**: Same bug as Bug 12, in the GLM-4.7 variant of `detect_tool_call_start`. Calls the same `chunk_ends_with_token_prefix()` function with the same multibyte UTF-8 slicing risk.
-
-**How to fix**: Same as Bug 12.
 
 ---
 
@@ -652,6 +656,8 @@ The differential fuzzer found real bugs almost immediately with 1-4 byte inputs.
 | Memory exhaustion | [#5275](https://github.com/ai-dynamo/dynamo/issues/5275) Memory leak under load | Same class |
 
 **Novelty**: 7 of 8 bug categories are NOVEL (no upstream reports). No existing fuzzing infrastructure exists upstream — this is the first.
+
+**Post-audit note**: Bugs 12/13 were already fixed upstream. Bugs 5, 10, 19 are debatable trade-offs. The remaining 15 bugs are confirmed real.
 
 ---
 

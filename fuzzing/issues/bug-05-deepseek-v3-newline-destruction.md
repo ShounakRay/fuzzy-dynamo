@@ -56,6 +56,10 @@ let normalized = args_str
 
 Or better yet, only normalize structural whitespace outside of JSON string values.
 
+### Additional Context
+
+**Note**: This normalization is a deliberate recovery path for malformed JSON (e.g., model output with Python-style indentation). The newline destruction is a trade-off — joining with `"\n"` instead of `" "` would preserve string newlines but could break the JSON fix for certain malformed inputs. Whether this warrants changing depends on how frequently models emit code-containing arguments in malformed JSON format.
+
 ### Environment
 
 - dynamo: main branch

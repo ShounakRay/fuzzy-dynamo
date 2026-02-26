@@ -55,6 +55,10 @@ Either:
 2. Use a `HashMap<ConfigKey, Regex>` keyed by the config's tokens
 3. Assert that the config matches the cached version and panic/warn if not
 
+### Additional Context
+
+**Note**: This is currently benign because only one `KimiK2ParserConfig` exists in practice (the default). The bug would only manifest if a second distinct config were introduced. However, the API signature accepting `&KimiK2ParserConfig` creates a false contract — callers reasonably expect different configs to produce different behavior.
+
 ### Environment
 
 - dynamo: main branch

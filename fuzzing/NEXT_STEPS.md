@@ -2,7 +2,7 @@
 
 ## Status
 
-All 27 fuzz targets have been run across 5 crates. 6 crash bugs confirmed with artifacts. 12 additional bugs found by code audit with regression tests. The infrastructure is complete and working.
+All 27 fuzz targets have been run across 5 crates. 7 crash bugs confirmed with artifacts. 12 additional bugs found by code audit with regression tests. The infrastructure is complete and working.
 
 ---
 
@@ -19,7 +19,8 @@ These are confirmed crashes with minimal reproducers — ready for upstream fixe
 - **Bug 15**: `compute_block_hash_for_seq` panic on `kv_block_size=0` — add zero-guard.
 
 ### Medium
-- **Bug 1**: Streaming prefix-matching content loss — rework `force_reasoning` prefix buffering.
+- **Bug 20/1**: Streaming prefix-matching content loss — skip prefix-buffering check when `force_reasoning=true`, or set `stripped_think_start = true` at construction time.
+- **Bug 19/2**: `.trim()` asymmetry — remove `.trim()` from one-shot path to match streaming behavior.
 - **Bugs 3-5, 7**: Parser data corruption bugs — case-insensitive matching, boundary-aware replacement.
 
 ---
@@ -51,6 +52,20 @@ The current runs were 2-5 minutes each. Longer runs (30+ min) on stateful target
 - `fuzz_radix_tree_events` — already found a crash in 2 min, more variants likely
 - `fuzz_two_part_decode` — overflow found fast, but other codec paths need deeper exploration
 - `fuzz_differential` — found bugs in 2 different runs, more parser-specific differentials possible
+
+### Parser-Specific Extended Runs
+
+**Extended differential runs** (2+ hours): Run `fuzz_differential` with the token dictionary to explore larger inputs and more parser types. The Kimi unicode tokens (`◁think▷`) and multi-block reasoning paths haven't been deeply explored yet. The differential fuzzer found 2 bugs almost immediately with trivially small inputs — longer runs with the dictionary will reach deeper structural coverage.
+
+```bash
+FUZZ_DICT=lib/parsers/fuzz/parser_tokens.dict FUZZ_TIMEOUT=7200 ./fuzzing/run_parser_fuzz.sh fuzz_differential
+```
+
+**Extended ReDoS runs** (1+ hour): The pythonic regex has the most complex pattern with nested quantifiers. Stress-test with longer inputs and higher per-input timeout:
+
+```bash
+FUZZ_TIMEOUT_PER_INPUT=2 FUZZ_MAX_LEN=1024 FUZZ_TIMEOUT=3600 ./fuzzing/run_parser_fuzz.sh fuzz_redos
+```
 
 ### Coverage-Guided Seed Refinement
 Use `fuzzing/coverage.sh` to identify uncovered branches, then craft targeted seeds to force execution through them. More efficient than blind long runs.

@@ -97,3 +97,5 @@ Crash artifacts:
 - `fuzz/artifacts/fuzz_differential/crash-792ce6d99566f570120f2897290fc1e3d06f413d` (prefix content loss)
 
 Related: #3393 (acknowledges parser "loss of tokens").
+
+**Note on trim asymmetry (issue 1)**: The streaming path cannot trim mid-stream since more data may follow. This is arguably by-design — streaming and one-shot have legitimately different contracts regarding trailing whitespace. The prefix content loss (issue 2) is the more serious problem.
