@@ -82,3 +82,13 @@ doc = false
 name = "fuzz_with_tools"
 path = "fuzz_targets/fuzz_with_tools.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_content_preservation"
+path = "fuzz_targets/fuzz_content_preservation.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_streaming_monotonicity"
+path = "fuzz_targets/fuzz_streaming_monotonicity.rs"
+doc = false
