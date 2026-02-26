@@ -1,0 +1,93 @@
+# Parser token dictionary for libFuzzer
+# XML parser tokens
+xml_tool_call_start="<tool_call>"
+xml_tool_call_end="</tool_call>"
+xml_function_start="<function="
+xml_function_end="</function>"
+xml_parameter_start="<parameter="
+xml_parameter_end="</parameter>"
+
+# GLM-4.7 parser tokens
+glm47_arg_key_start="<arg_key>"
+glm47_arg_key_end="</arg_key>"
+glm47_arg_value_start="<arg_value>"
+glm47_arg_value_end="</arg_value>"
+
+# Kimi K2 parser tokens
+kimi_section_begin="<|tool_calls_section_begin|>"
+kimi_section_end="<|tool_calls_section_end|>"
+kimi_section_begin_singular="<|tool_call_section_begin|>"
+kimi_section_end_singular="<|tool_call_section_end|>"
+kimi_call_begin="<|tool_call_begin|>"
+kimi_call_end="<|tool_call_end|>"
+kimi_arg_begin="<|tool_call_argument_begin|>"
+
+# DeepSeek unicode tokens
+deepseek_begin="\xe3\x80\x8a\xef\xbd\x9ctool\xe2\x96\x81calls\xe2\x96\x81begin\xef\xbd\x9c\xe3\x80\x8b"
+deepseek_sep="\xe3\x80\x8a\xef\xbd\x9ctool\xe2\x96\x81sep\xef\xbd\x9c\xe3\x80\x8b"
+deepseek_end="\xe3\x80\x8a\xef\xbd\x9ctool\xe2\x96\x81calls\xe2\x96\x81end\xef\xbd\x9c\xe3\x80\x8b"
+
+# DSML parser tokens
+dsml_func_start="<|function_calls_start|>"
+dsml_func_end="<|function_calls_end|>"
+dsml_invoke_start="<|invoke_start|>"
+dsml_invoke_end="<|invoke_end|>"
+dsml_parameter_start="<|parameter_start|>"
+dsml_parameter_end="<|parameter_end|>"
+
+# Pythonic parser tokens
+pythonic_start="<|python_start|>"
+pythonic_end="<|python_end|>"
+pythonic_bracket_open="["
+pythonic_bracket_close="]"
+pythonic_paren_open="("
+pythonic_paren_close=")"
+
+# Reasoning parser tokens
+think_start="<think>"
+think_end="</think>"
+kimi_think_start="\xe2\x97\x81think\xe2\x96\xb7"
+kimi_think_end="\xe2\x97\x81/think\xe2\x96\xb7"
+mistral_think_start="[THINK]"
+mistral_think_end="[/THINK]"
+
+# JSON structural tokens
+json_brace_open="{"
+json_brace_close="}"
+json_bracket_open="["
+json_bracket_close="]"
+json_colon=":"
+json_comma=","
+json_quote="\""
+json_null="null"
+json_true="true"
+json_false="false"
+
+# Common function/argument patterns
+func_prefix="functions."
+func_name="name"
+func_arguments="arguments"
+func_parameters="parameters"
+type_string="\"type\":\"string\""
+type_integer="\"type\":\"integer\""
+type_number="\"type\":\"number\""
+type_boolean="\"type\":\"boolean\""
+type_array="\"type\":\"array\""
+type_object="\"type\":\"object\""
+
+# HTML entities
+html_lt="&lt;"
+html_gt="&gt;"
+html_amp="&amp;"
+html_quot="&quot;"
+html_apos="&apos;"
+html_x27="&#x27;"
+html_39="&#39;"
+
+# Edge case values
+single_quote="'"
+double_quote="\""
+null_str="null"
+none_str="None"
+true_str="True"
+false_str="False"

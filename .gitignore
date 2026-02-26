@@ -137,3 +137,9 @@ package-lock.json
 # macOS
 .DS_Store
 **/.DS_Store
+
+# Fuzzing
+fuzzing/.fuzz-env/
+**/fuzz/target/
+**/fuzz/corpus/
+**/fuzz/artifacts/

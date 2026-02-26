@@ -1,0 +1,6 @@
+<tool_call> 	 fünc_namé<arg_key>key</arg_key><arg_value>val</arg_value></tool_call>
+<tool_call>	func	<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>
+<tool_call>  name  <arg_key>  spaced_key  </arg_key><arg_value>  spaced_val  </arg_value></tool_call>
+<tool_call>
+func<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>
+<tool_call>café<arg_key>naïve</arg_key><arg_value>résumé</arg_value></tool_call>

@@ -1,0 +1,15 @@
+<tool_call>
+<function=">
+<parameter=">value</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function='>
+<parameter='>value</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function="name">
+<parameter="p">v</parameter>
+</function>
+</tool_call>

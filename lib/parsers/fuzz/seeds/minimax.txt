@@ -1,0 +1,5 @@
+<minimax:tool_call>
+<invoke name="get_weather">
+<parameter name="location">San Francisco</parameter>
+</invoke>
+</minimax:tool_call>

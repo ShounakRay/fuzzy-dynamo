@@ -1,0 +1,5 @@
+<｜DSML｜function_calls>
+<｜DSML｜invoke name="get_weather">
+<｜DSML｜parameter name="location" string="true">San Francisco</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜function_calls>
