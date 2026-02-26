@@ -1,0 +1,33 @@
+[package]
+name = "dynamo-tokens-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.dynamo-tokens]
+path = ".."
+
+# Prevent cargo-fuzz from being pulled into the workspace
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_positional_sequence_hash"
+path = "fuzz_targets/fuzz_positional_sequence_hash.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_positional_lineage_hash"
+path = "fuzz_targets/fuzz_positional_lineage_hash.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_token_block_sequence"
+path = "fuzz_targets/fuzz_token_block_sequence.rs"
+doc = false
