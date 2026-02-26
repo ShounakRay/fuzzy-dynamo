@@ -1,0 +1,40 @@
+[package]
+name = "dynamo-runtime-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+tokio = { version = "1", features = ["rt", "io-util"] }
+
+[dependencies.dynamo-runtime]
+path = ".."
+
+# Prevent cargo-fuzz from being pulled into the workspace
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_two_part_roundtrip"
+path = "fuzz_targets/fuzz_two_part_roundtrip.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_two_part_decode"
+path = "fuzz_targets/fuzz_two_part_decode.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_tcp_decode"
+path = "fuzz_targets/fuzz_tcp_decode.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_frame_decode"
+path = "fuzz_targets/fuzz_frame_decode.rs"
+doc = false
