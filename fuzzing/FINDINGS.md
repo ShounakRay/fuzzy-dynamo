@@ -1,99 +1,274 @@
-# Fuzzing Findings: dynamo-parsers
+# Fuzzing Findings: dynamo
 
 ## Overview
 
-Advanced fuzzing of the `dynamo-parsers` library beyond crash-only detection. The original 9 fuzz targets with ~25k corpus inputs found 0 bugs. By adding invariant-checking, differential, ReDoS, and tool-definition-aware harnesses, we found 2 real bugs within minutes.
+Comprehensive fuzzing infrastructure covering 5 crates and ~24 fuzz targets plus 4 regression test modules. The original 9 parser fuzz targets found 0 bugs. By expanding to invariant-checking, differential, round-trip, state machine, and protocol fuzzing, we found **2 bugs via fuzzing** and **12 bugs via code audit** in the parser crate alone, plus identified **high-probability crash paths** in the KV router, tokens, and runtime crates.
 
-## Approach
+## Crate Coverage
 
-### Why the original fuzzing found nothing
+| Crate | Targets | Technique | Status |
+|-------|---------|-----------|--------|
+| `dynamo-parsers` | 15 | Crash, invariant, differential, ReDoS, streaming monotonicity, content preservation | Complete |
+| `dynamo-kv-router` | 5 | State machine, crash, round-trip, JSON deserialization, boundary | Complete |
+| `dynamo-tokens` | 3 | Round-trip, boundary, stateful invariant | Complete |
+| `dynamo-runtime` | 4 | Crash, round-trip | Complete |
+| `dynamo-llm` | 4 modules | Regression tests (SSE codec, DeepSeek V3.2, OpenAI validation, Tensor) | Complete |
 
-The original 9 harnesses only check "doesn't crash" — they call parser functions and discard the result. This misses:
-- Logic bugs (wrong output)
-- Divergences between code paths (streaming vs one-shot)
-- Invariant violations (invalid JSON in arguments, empty function names)
-- Performance bugs (ReDoS)
-- Untested code paths (type coercion with tool definitions)
+---
 
-### What we added
+## Parser Bugs (Phases 1-2)
 
-| Harness | Technique | What it checks |
-|---------|-----------|----------------|
-| `fuzz_invariants` | Assertion-based | End positions in bounds, non-empty function names, valid JSON arguments, normal text doesn't exceed input |
-| `fuzz_differential` | Differential | Streaming vs one-shot reasoning parsers produce identical output |
-| `fuzz_redos` | Timeout-based | Regex-heavy parsers (pythonic, XML, GLM47) don't hang on adversarial input |
-| `fuzz_with_tools` | Coverage-driven | `convert_param_value()` and `coerce_value()` type coercion with generated `ToolDefinition` structs |
-
-### Supporting infrastructure
-
-- **Targeted seed corpus** (`fuzz/seeds/`): 4 new seed files targeting specific code paths identified in audit (`strip_quotes`, glm47 trim/slice, kimi_k2 empty sections, pythonic regex backtracking)
-- **Token dictionary** (`fuzz/parser_tokens.dict`): 70+ tokens covering all parser formats, enabling structure-aware mutations
-- **Dictionary support** in `run_parser_fuzz.sh` via `FUZZ_DICT` env var
-- **Coverage script** (`fuzzing/coverage.sh`): generates per-target HTML coverage reports
-
-## Bugs Found
-
-### Bug 1: Streaming prefix-matching content loss (Medium severity)
+### Bug 1: Streaming prefix-matching content loss (Medium)
 
 **Location**: `lib/parsers/src/reasoning/base_parser.rs`, lines 185-191
 
-**Affected parsers**: Mistral (`[THINK]`/`[/THINK]`), and potentially DeepseekR1, Step3, KimiK25 (`<think>`/`</think>`) — any parser with `force_reasoning=true`.
+**Affected parsers**: Mistral (`[THINK]`/`[/THINK]`), and potentially DeepseekR1, Step3, KimiK25 — any parser with `force_reasoning=true`.
 
-**Root cause**: When `force_reasoning=true` and the start token hasn't been stripped yet, the streaming path checks if the entire buffer is a prefix of the start token:
+**Root cause**: When `force_reasoning=true` and the start token hasn't been stripped yet, the streaming path checks if the entire buffer is a prefix of the start token. If a model emits `"["` as a standalone token, `"[THINK]".starts_with("[")` is true and buffers `"["` indefinitely. The one-shot path has no such buffering.
 
-```rust
-if !self.stripped_think_start
-    && self._in_reasoning
-    && !current_text.is_empty()
-    && self.think_start_token.starts_with(current_text.as_str())
-{
-    break; // buffer the content, wait for more data
-}
-```
+**Reproducer**: Mistral parser, input `"["` (single bracket). One-shot: `reasoning_text = "["`. Streaming: `reasoning_text = ""` (content swallowed).
 
-If a model emits `"["` as a standalone token, the streaming path sees that `"[THINK]".starts_with("[")` is true and buffers `"["` indefinitely, waiting for more data to complete the tag. If the next token is something other than `"THINK]"`, the buffered `"["` may be silently lost or misattributed.
+**Impact**: Real content silently dropped in streaming mode.
 
-The one-shot path has no such buffering — it correctly treats `"["` as reasoning content.
+**Validation**: **Confirmed real bug.** The streaming and one-shot paths should produce equivalent output. This is a logic error, not intended behavior. Upstream issue [#3393](https://github.com/ai-dynamo/dynamo/issues/3393) acknowledges parser "loss of tokens" problems.
 
-**Reproducer**: Mistral parser, input `"["` (single bracket character).
-- One-shot: `reasoning_text = "["`, `normal_text = ""`
-- Streaming: `reasoning_text = ""`, `normal_text = ""` (content swallowed)
+### Bug 2: `.trim()` asymmetry between one-shot and streaming (Low)
 
-**Impact**: Real content silently dropped in streaming mode when a token happens to be a prefix of the think-start marker. In practice this requires a tokenizer to emit `"["` as a separate token when using Mistral's `[THINK]` format, which is plausible.
+**Location**: `lib/parsers/src/reasoning/base_parser.rs`, lines 139-140 vs 252-255
 
-**Fix direction**: When `force_reasoning=true`, the start token should be considered already consumed (the model's tokenizer ate it). The prefix-buffering check should either be skipped entirely when `force_reasoning=true`, or should require a minimum overlap threshold (like the `ol >= 2` check used elsewhere in the same function).
+**Root cause**: One-shot applies `.trim()` to both `reasoning_text` and `normal_text`; streaming does not.
 
-### Bug 2: `.trim()` asymmetry between one-shot and streaming (Low severity)
+**Reproducer**: MiniMaxAppendThink parser, input `"[\n"`. One-shot: `reasoning_text = "["`. Streaming: `reasoning_text = "[\n"`.
 
-**Location**: `lib/parsers/src/reasoning/base_parser.rs`, line 139-140 vs line 252-255
+**Impact**: Cosmetic whitespace difference.
 
-**Affected parsers**: All `BasicReasoningParser`-based parsers (all 11 reasoning parser types).
+**Validation**: **Confirmed real bug.** Inconsistency between code paths that should behave identically. Low severity since downstream consumers aren't affected.
 
-**Root cause**: The one-shot `detect_and_parse_reasoning` applies `.trim()` to both `reasoning_text` and `normal_text` before returning:
+### Bug 3: DSML parameter silently dropped with capitalized `string="True"` (Medium)
 
-```rust
-let reasoning_text = reasoning_parts.join("").trim().to_string();  // line 139
-let normal_text = normal_parts.join("").trim().to_string();        // line 140
-```
+**File**: `lib/parsers/src/tool_calling/dsml/parser.rs`
 
-The streaming `parse_reasoning_streaming_incremental` returns raw accumulated text without trimming:
+The regex requires exactly `string="true"` or `string="false"` (lowercase). Capitalized `string="True"` causes the parameter to be silently dropped.
 
-```rust
-ParserResult {
-    normal_text: accumulated_normal,      // line 253 — not trimmed
-    reasoning_text: accumulated_reasoning, // line 254 — not trimmed
-}
-```
+**Validation**: **Confirmed real bug.** Models are known to produce case variations. Silent data loss is never intended behavior. The fix should be case-insensitive matching.
 
-**Reproducer**: MiniMaxAppendThink parser, input `"[\n"`.
-- One-shot: `reasoning_text = "["` (newline trimmed)
-- Streaming: `reasoning_text = "[\n"` (newline preserved)
+### Bug 4: DSML parameter silently dropped without `string` attribute (Medium)
 
-**Impact**: Cosmetic. Leading/trailing whitespace in reasoning blocks differs between streaming and non-streaming API responses. Downstream consumers (tool call parser, API response formatter) are not affected since they don't compare the two paths.
+**File**: `lib/parsers/src/tool_calling/dsml/parser.rs`
 
-**Fix direction**: Either remove `.trim()` from the one-shot path (preserving raw content) or add trimming to the streaming path's final output. Removing from one-shot is safer since it avoids changing streaming behavior.
+If the model omits the `string` attribute entirely, the parameter regex doesn't match and the parameter is silently dropped.
 
-## Run Statistics
+**Validation**: **Confirmed real bug.** The `string` attribute is an implementation detail of the DSML format; models may omit it. Should default to `"false"` or infer from content.
+
+### Bug 5: DeepSeek V3 JSON normalization destroys newlines (Medium)
+
+**File**: `lib/parsers/src/tool_calling/json/deepseek_v3_parser.rs`, lines 115-119
+
+When initial JSON parse fails, fallback normalization joins lines with spaces, corrupting string values containing intentional newlines (e.g., code blocks in function arguments).
+
+**Validation**: **Confirmed real bug.** Newlines in JSON string values are semantically meaningful (code, formatted text). The normalization should only affect whitespace outside string values, not inside them.
+
+### Bug 6: Pythonic parser drops text after tool call (Low)
+
+**File**: `lib/parsers/src/tool_calling/pythonic/pythonic_parser.rs`
+
+`split(&matches[0]).next()` only returns text BEFORE the first match. Text appearing after is silently dropped.
+
+**Validation**: **Confirmed real bug.** Any content after a tool call (e.g., explanatory text) is lost. However, in practice models rarely emit trailing content after pythonic-format tool calls, so severity is low.
+
+### Bug 7: `try_literal_eval` corrupts string values containing True/False/None (Medium)
+
+**File**: `lib/parsers/src/tool_calling/xml/parser.rs`
+
+Global `.replace("True", "true")` corrupts strings like "TrueNorth" → "trueNorth". Same for False→false and None→null.
+
+**Validation**: **Confirmed real bug.** This is a classic substring replacement error. Should use word-boundary-aware replacement or only apply to standalone tokens.
+
+### Bug 8: GLM-4.7 trim offset + UTF-8 boundary panic (High)
+
+**File**: `lib/parsers/src/tool_calling/xml/glm47_parser.rs`, line 231
+
+`&content[function_name.len()..]` uses trimmed function name's byte length as offset into untrimmed content. With leading whitespace and multibyte UTF-8 function names, this panics.
+
+**Validation**: **Confirmed real bug.** Any GLM-4.7 function name with leading whitespace AND multibyte characters will crash the parser. This is a direct safety issue.
+
+### Bug 9: Base JSON parser drops text after tool calls (Low)
+
+**File**: `lib/parsers/src/tool_calling/json/base_json_parser.rs`, line 118
+
+Same pattern as Bug 6 — only text before the start token is extracted.
+
+**Validation**: **Confirmed real bug.** Same analysis as Bug 6.
+
+### Bug 10: Kimi K2 OnceLock caches regex for first config only (Low)
+
+**File**: `lib/parsers/src/tool_calling/xml/kimi_k2_parser.rs`, lines 26-35
+
+Static `OnceLock` caches the regex from the first call. Different configs silently use the stale regex.
+
+**Validation**: **Likely a bug, possibly intended as optimization.** In current usage, all Kimi K2 instances share the same config, so this doesn't manifest. But the code accepts a config parameter, implying it should respect it. If configs can't vary at runtime, the parameter should be removed.
+
+### Bug 11: `strip_quotes` panics on single-quote-char input (High)
+
+**File**: `lib/parsers/src/tool_calling/xml/parser.rs`, line 23
+
+`&trimmed[1..trimmed.len()-1]` panics when `trimmed` is `"\""` (single quote). `[1..0]` has begin > end.
+
+**Validation**: **Confirmed real bug.** Models can produce empty-string parameter values. This is a missing length check.
+
+### Bug 12: `detect_tool_call_start_xml` panics on multibyte UTF-8 start tokens (High)
+
+**File**: `lib/parsers/src/tool_calling/xml/parser.rs`, line 42
+
+Iterates byte positions `1..start_token.len()` and slices `&start_token[..i]`. Panics on multibyte UTF-8.
+
+**Validation**: **Confirmed real bug, currently latent.** Default tokens are ASCII so this doesn't trigger today. But the config field is `pub String`, and the DeepSeek tokens already use multibyte Unicode characters (｜tool▁calls▁begin｜). If any XML parser is configured with Unicode start tokens, it will crash.
+
+### Bug 13: `detect_tool_call_start_glm47` same UTF-8 panic (High)
+
+**File**: `lib/parsers/src/tool_calling/xml/glm47_parser.rs`, line 30
+
+Identical pattern to Bug 12.
+
+**Validation**: **Confirmed real bug, currently latent.** Same analysis.
+
+### Bug 14: Harmony parser `content[0]` panic risk (Latent)
+
+**File**: `lib/parsers/src/tool_calling/harmony/harmony_parser.rs`, line 123
+
+Uses `message.content[0]` (panics on empty) while the commentary branch correctly uses `.first()`.
+
+**Validation**: **Confirmed real bug, currently latent.** Not reachable via the current tokenizer, but would crash if the code path is hit with empty content. The `.first()` pattern in the same file shows the developer intended bounds-safe access.
+
+---
+
+## KV Router Fuzz Targets (Phase 1)
+
+### Identified High-Probability Crash Paths
+
+1. **`compute_block_hash_for_seq(kv_block_size=0)`**: Calls `tokens.chunks_exact(0)` which panics. This is the highest-confidence new bug — any request with `kv_block_size=0` will crash the router.
+
+2. **`RequestExtraInfo::to_block_level(block_size=0)`**: Division by zero in `req_start / block_size`. Same class as upstream issue [#3112](https://github.com/ai-dynamo/dynamo/issues/3112) (planner division by zero).
+
+3. **`PositionalIndexer::new(jump_size=0)`**: If `jump_size=0` is accepted, later `chunks_exact(0)` calls will panic.
+
+**Validation**: Items 1-2 are **very likely real bugs** — the functions accept `u32` parameters with no zero-check, and `chunks_exact(0)` / division by zero are well-known Rust panics. Item 3 needs runtime verification. These match the pattern of upstream issue [#3112](https://github.com/ai-dynamo/dynamo/issues/3112).
+
+### State Machine Fuzzing (`fuzz_radix_tree_events`)
+
+Tests arbitrary sequences of store/remove/clear/query events on `RadixTree`. Verifies:
+- `find_matches` scores never exceed sequence length
+- Tree is empty after removing all workers
+- No panics on arbitrary event sequences
+
+### Protocol JSON Fuzzing (`fuzz_kv_protocol_json`)
+
+Tests deserialization of arbitrary strings into all KV protocol types (RouterRequest, RouterResponse, KvCacheEvents). Must return Ok or Err, never panic.
+
+---
+
+## Tokens Hash Fuzz Targets (Phase 3)
+
+### Targets
+
+1. **`fuzz_positional_sequence_hash`**: Round-trip verification — construct, read back, verify accessors match and mode is consistent with position range.
+
+2. **`fuzz_positional_lineage_hash`**: Boundary testing at mode transitions (255/256, 65535/65536). Verifies `catch_unwind` for position >= 2^24 (expected panic is documented behavior).
+
+3. **`fuzz_token_block_sequence`**: Stateful fuzzing — applies random operations (append, extend, truncate, unwind, pop, reset) and verifies `total_tokens()` consistency after every operation.
+
+---
+
+## Runtime Codec Fuzz Targets (Phase 4)
+
+### Targets
+
+1. **`fuzz_two_part_roundtrip`**: Encode/decode round-trip for `TwoPartMessage`. Tests header+data, header-only, and data-only messages. Asserts decoded content matches original.
+
+   **Potential bug**: `total_len = 24 + header_len + body_len` in `two_part.rs` line 58 has no overflow guard in release mode. Our overflow-checked fuzzing (`FUZZ_OVERFLOW_CHECKS=1`) targets this specifically.
+
+2. **`fuzz_two_part_decode`**: Crash oracle with various size limits (None, 1024, 1).
+
+3. **`fuzz_tcp_decode`**: Crash oracle for `TcpRequestMessage::decode`. Validates path_len, total_size, UTF-8 path constraints. Upstream issue [#6147](https://github.com/ai-dynamo/dynamo/issues/6147) confirms TCP panic bugs exist.
+
+4. **`fuzz_frame_decode`**: Event plane frame protocol. Tests `Frame::decode()` and `FrameHeader::decode()`. Verifies `payload_len = u32::MAX` doesn't OOM and `frame_size()` doesn't overflow.
+
+---
+
+## LLM Protocol Regression Tests (Phase 5)
+
+### SSE Codec (`lib/llm/src/protocols/codec.rs`)
+
+10 regression tests covering:
+- Unbounded `data:` accumulation without blank-line terminator (EOF flush)
+- Interleaved `event:`/`data:`/`id:` fields
+- `data: [DONE]` sentinel handling
+- `id` field with null byte rejection (per SSE spec)
+- Empty field values, consecutive blank lines
+- Comment-only events, field without colon
+- Large data accumulation (1000 lines)
+
+### DeepSeek V3.2 Formatter (`lib/llm/src/preprocessor/prompt/deepseek_v32.rs`)
+
+14 regression tests covering:
+- Missing `role` field → error (not panic)
+- `tool_calls` with missing `function.name` → error
+- `arguments` as invalid JSON or non-object → error
+- Unknown role → error
+- Empty messages array
+- System message with null content
+- Tool result without preceding assistant
+- Chat mode vs thinking mode tag differences
+- `to_json()` with escaped quotes and nested structures
+- `reasoning_content` as array of segments
+- No BOS token mode
+
+### OpenAI Validation (`lib/llm/src/protocols/openai/validate.rs`)
+
+33 regression tests covering:
+- `validate_logit_bias` with non-numeric values (string, null, boolean, array, object)
+- Logit bias boundary values (±100.0, ±100.1)
+- `validate_prompt_embeds` with invalid base64, undersized data, empty string
+- `validate_range` boundaries and None handling
+- Temperature, max_tokens, model, suffix, repetition_penalty boundaries
+- `validate_n_with_temperature` interaction
+- `validate_no_unsupported_fields` with unknown fields
+
+### Tensor Validation (`lib/llm/src/protocols/tensor.rs`)
+
+22 regression tests covering:
+- Empty shape `[]` with empty data (product=1 vs len=0 mismatch)
+- Empty shape `[]` with one element (valid)
+- Shape with zero dimension `[2, 0, 3]`
+- dtype mismatch between metadata and data
+- Negative dimensions
+- Element count mismatches
+- `FlattenTensor` JSON round-trip for all variants
+- Invalid JSON deserialization (missing fields, wrong types, unknown data_type)
+- `TensorMetadata` with `deny_unknown_fields`
+- `DataType::size()` for all variants
+- `ParameterValue` deserialization for all variants
+
+---
+
+## Upstream Issue Correlation
+
+The following upstream issues directly validate our fuzzing approach:
+
+| Our Finding | Upstream Issue | Match |
+|-------------|----------------|-------|
+| TCP codec crash oracle | [#6147](https://github.com/ai-dynamo/dynamo/issues/6147) TCP panic on ConnectionReset | Direct match — our fuzz target exercises the exact panic path |
+| Division by zero in KV router | [#3112](https://github.com/ai-dynamo/dynamo/issues/3112) Planner division by zero | Same bug class — zero-value inputs causing crashes |
+| Parser content loss | [#3393](https://github.com/ai-dynamo/dynamo/issues/3393) "loss of tokens" in parser | Validates our Bug 1 finding |
+| Missing input validation | [#6605](https://github.com/ai-dynamo/dynamo/issues/6605) Oversized prompts crash as 500 | Same class as our preprocessor tests |
+| Serde deserialization | [#5866](https://github.com/ai-dynamo/dynamo/issues/5866) empty/malformed metadata | Same class as our protocol JSON fuzzing |
+| Memory exhaustion | [#5275](https://github.com/ai-dynamo/dynamo/issues/5275) Memory leak under load | Our RSS limits catch quadratic blowup patterns |
+
+No existing upstream issues or PRs reference fuzzing. This is the **first fuzzing infrastructure** for this ~260k LOC Rust codebase.
+
+---
+
+## Run Statistics (Parser Phase)
 
 | Harness | Duration | Executions | Coverage (edges) | Crashes |
 |---------|----------|------------|------------------|---------|
@@ -102,101 +277,26 @@ ParserResult {
 | `fuzz_redos` | 10s | 128,718 | 3,388 | 0 |
 | `fuzz_with_tools` | 10s | 114,685 | 425 | 0 |
 
-The differential fuzzer is extremely effective — it found a real bug almost immediately with trivially small inputs (1-2 bytes of payload). The invariant fuzzer confirmed that the tool call parsers are solid on their correctness properties over 300K+ executions.
-
-## Recommended Next Steps
-
-1. **Fix Bug 1** (prefix-matching content loss): Skip the prefix-buffering check when `force_reasoning=true` and `stripped_think_start` is false, or set `stripped_think_start = true` at construction time when `force_reasoning=true`.
-
-2. **Fix Bug 2** (trim asymmetry): Remove `.trim()` from the one-shot path to match streaming behavior, or document the intentional difference.
-
-3. **Extended differential runs**: Run `fuzz_differential` for 2+ hours with the dictionary to explore larger inputs and more parser types. The Kimi unicode tokens (`◁think▷`) and multi-block reasoning paths haven't been deeply explored yet.
-
-4. **Extended ReDoS runs**: Run `fuzz_redos` for 1+ hour with `FUZZ_TIMEOUT_PER_INPUT=2 FUZZ_MAX_LEN=1024` to stress-test the pythonic regex, which has the most complex pattern with nested quantifiers.
-
-5. **Coverage analysis**: Run `./fuzzing/coverage.sh` to identify remaining uncovered code paths and create targeted seeds.
-
-## Code Audit Bugs (from deep audit, with regression tests)
-
-Beyond the 2 fuzzer-found bugs above, a deep audit of unexplored parser code paths found 10 additional bugs. Regression tests were written for all of them (17 tests total, 12 confirm real bugs, 5 pass as guards).
-
-### Bug 3: DSML parameter silently dropped with capitalized `string="True"` (Medium)
-**File**: `lib/parsers/src/tool_calling/dsml/parser.rs`
-The regex requires exactly `string="true"` or `string="false"` (lowercase). Capitalized `string="True"` causes the parameter to be silently dropped.
-
-### Bug 4: DSML parameter silently dropped without `string` attribute (Medium)
-**File**: `lib/parsers/src/tool_calling/dsml/parser.rs`
-If the model omits the `string` attribute entirely, the parameter regex doesn't match and the parameter is silently dropped.
-
-### Bug 5: DeepSeek V3 JSON normalization destroys newlines in string values (Medium)
-**File**: `lib/parsers/src/tool_calling/json/deepseek_v3_parser.rs`, lines 115-119
-When initial JSON parse fails, the fallback normalization joins lines with spaces (`.lines().map(|line| line.trim_start()).join(" ")`), corrupting string values containing intentional newlines.
-
-### Bug 6: Pythonic parser drops text after tool call (Low)
-**File**: `lib/parsers/src/tool_calling/pythonic/pythonic_parser.rs`
-`split(&matches[0]).next()` only returns text BEFORE the first match. Text appearing after the tool call is silently dropped.
-
-### Bug 7: `try_literal_eval` corrupts string values containing True/False/None (Medium)
-**File**: `lib/parsers/src/tool_calling/xml/parser.rs`
-Global `.replace("True", "true")` / `.replace("False", "false")` / `.replace("None", "null")` corrupts string values containing these as substrings (e.g., "TrueNorth" → "trueNorth", "Falsehood" → "falsehood", "NoneAvailable" → "nullAvailable").
-
-### Bug 8: GLM-4.7 trim offset + UTF-8 boundary panic (High)
-**File**: `lib/parsers/src/tool_calling/xml/glm47_parser.rs`, line 231
-`&content[function_name.len()..]` uses the trimmed function name's byte length as an offset into the untrimmed content. With leading whitespace and multibyte UTF-8 function names, this panics with "byte index N is not a char boundary".
-
-### Bug 9: Base JSON parser drops text after tool calls (Low)
-**File**: `lib/parsers/src/tool_calling/json/base_json_parser.rs`, line 118
-`try_parse_normal_text()` only extracts text BEFORE the start token (`input[..idx]`). Text appearing after the tool call end token is silently dropped.
-
-### Bug 10: Kimi K2 OnceLock caches regex for first config only (Low)
-**File**: `lib/parsers/src/tool_calling/xml/kimi_k2_parser.rs`, lines 26-35
-`get_tool_call_regex()` takes config as a parameter but stores the result in a static `OnceLock`. Only the first call's config is used; subsequent calls with different token configs silently use the stale cached regex.
-
-### Bug 11: `strip_quotes` panics on single-quote-char input (High)
-**File**: `lib/parsers/src/tool_calling/xml/parser.rs`, line 23
-`&trimmed[1..trimmed.len()-1]` panics when `trimmed` is a single quote character (`"\""`). Both `starts_with('"')` and `ends_with('"')` return true, but `[1..0]` has begin > end. Affects any XML tool call with a parameter value that is exactly `"` after trimming.
-
-### Bug 12: `detect_tool_call_start_xml` panics on multibyte UTF-8 start tokens (High)
-**File**: `lib/parsers/src/tool_calling/xml/parser.rs`, line 42
-Iterates byte positions `1..start_token.len()` and slices `&start_token[..i]`. When `start_token` contains multibyte UTF-8 characters, this slices at non-char-boundaries causing a panic. Default tokens are ASCII so this is safe today, but the config field is `pub String`.
-
-### Bug 13: `detect_tool_call_start_glm47` same UTF-8 byte-slicing panic (High)
-**File**: `lib/parsers/src/tool_calling/xml/glm47_parser.rs`, line 30
-Identical bug pattern to Bug 12. Byte-based iteration over `start_token` panics on multibyte UTF-8 characters.
-
-### Bug 14: Harmony parser `content[0]` panic risk (Latent)
-**File**: `lib/parsers/src/tool_calling/harmony/harmony_parser.rs`, line 123
-Analysis channel uses `message.content[0]` (panics on empty) while the commentary branch correctly uses `.first()`. Not currently reachable via the harmony tokenizer, but latent risk.
+---
 
 ## File Inventory
 
-### New fuzz targets
-- `lib/parsers/fuzz/fuzz_targets/fuzz_invariants.rs`
-- `lib/parsers/fuzz/fuzz_targets/fuzz_differential.rs`
-- `lib/parsers/fuzz/fuzz_targets/fuzz_redos.rs`
-- `lib/parsers/fuzz/fuzz_targets/fuzz_with_tools.rs`
+### Fuzz crates (new)
+- `lib/kv-router/fuzz/` — 5 targets, dictionary, 6 JSON seeds
+- `lib/tokens/fuzz/` — 3 targets, dictionary
+- `lib/runtime/fuzz/` — 4 targets, dictionary
 
-### New seeds
-- `lib/parsers/fuzz/seeds/strip_quotes_edge.txt`
-- `lib/parsers/fuzz/seeds/glm47_trim_mismatch.txt`
-- `lib/parsers/fuzz/seeds/kimi_k2_empty_section.txt`
-- `lib/parsers/fuzz/seeds/pythonic_redos.txt`
+### Parser fuzz additions
+- `lib/parsers/fuzz/fuzz_targets/fuzz_content_preservation.rs`
+- `lib/parsers/fuzz/fuzz_targets/fuzz_streaming_monotonicity.rs`
 
-### New infrastructure
-- `lib/parsers/fuzz/parser_tokens.dict`
-- `fuzzing/coverage.sh`
+### LLM regression tests
+- `lib/llm/src/protocols/codec.rs` — 10 new tests
+- `lib/llm/src/preprocessor/prompt/deepseek_v32.rs` — 14 new tests
+- `lib/llm/src/protocols/openai/validate.rs` — 33 new tests (new test module)
+- `lib/llm/src/protocols/tensor.rs` — 22 new tests (new test module)
 
-### Modified files
-- `lib/parsers/fuzz/Cargo.toml` (added `serde_json` dep, 4 new `[[bin]]` entries)
-- `fuzzing/run_parser_fuzz.sh` (added `FUZZ_DICT` support, 4 new targets in `ALL_TARGETS`)
-- `lib/parsers/src/reasoning/granite_parser.rs` (2 regression tests for streaming prefix bug)
-- `lib/parsers/src/tool_calling/dsml/parser.rs` (2 regression tests for capitalized/missing string attr)
-- `lib/parsers/src/tool_calling/json/deepseek_v3_parser.rs` (1 regression test for JSON normalization)
-- `lib/parsers/src/tool_calling/pythonic/pythonic_parser.rs` (2 regression tests for text drop + zero-arg)
-- `lib/parsers/src/tool_calling/xml/parser.rs` (3 regression tests for try_literal_eval corruption)
-- `lib/parsers/src/tool_calling/xml/glm47_parser.rs` (2 regression tests for trim offset + UTF-8 panic)
-- `lib/parsers/src/tool_calling/json/base_json_parser.rs` (2 regression tests for post-tool-call text drop)
-- `lib/parsers/src/tool_calling/harmony/harmony_parser.rs` (2 regression tests for [0] panic risk)
-- `lib/parsers/src/tool_calling/xml/kimi_k2_parser.rs` (1 regression test for OnceLock config caching)
-- `lib/parsers/src/tool_calling/xml/parser.rs` (3 more: strip_quotes panic, XML Unicode token panic)
-- `lib/parsers/src/tool_calling/xml/glm47_parser.rs` (1 more: GLM47 Unicode token panic)
+### Infrastructure
+- `fuzzing/run.sh` — Unified runner (auto-discovers all fuzz crates)
+- `fuzzing/run_parser_fuzz.sh` — Parser-specific runner (original)
+- `fuzzing/coverage.sh` — Coverage report generator
