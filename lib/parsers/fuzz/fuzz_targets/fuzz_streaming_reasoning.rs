@@ -1,6 +1,7 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use dynamo_parsers::reasoning::{ReasoningParser, ReasoningParserType};
+use dynamo_parsers::reasoning::ReasoningParser;
+use dynamo_parsers_fuzz::select_parser_type;
 
 // Fuzz streaming/incremental reasoning parsers.
 // Splits input into random-sized chunks and feeds them sequentially,
@@ -9,21 +10,7 @@ fuzz_target!(|data: &[u8]| {
     if data.len() < 2 { return; }
     let Ok(s) = std::str::from_utf8(&data[1..]) else { return };
 
-    // Use first byte to select parser type
-    let types = [
-        ReasoningParserType::DeepseekR1,
-        ReasoningParserType::Basic,
-        ReasoningParserType::GptOss,
-        ReasoningParserType::Qwen,
-        ReasoningParserType::NemotronDeci,
-        ReasoningParserType::Kimi,
-        ReasoningParserType::KimiK25,
-        ReasoningParserType::Step3,
-        ReasoningParserType::Mistral,
-        ReasoningParserType::Granite,
-        ReasoningParserType::MiniMaxAppendThink,
-    ];
-    let parser_type = types[data[0] as usize % types.len()];
+    let parser_type = select_parser_type(data[0]);
     let mut parser = parser_type.get_reasoning_parser();
 
     // Split string into chunks at arbitrary positions using remaining bytes

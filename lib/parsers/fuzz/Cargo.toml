@@ -7,6 +7,10 @@ edition = "2024"
 [package.metadata]
 cargo-fuzz = true
 
+[lib]
+name = "dynamo_parsers_fuzz"
+path = "src/lib.rs"
+
 [dependencies]
 libfuzzer-sys = "0.4"
 serde_json = "1"
