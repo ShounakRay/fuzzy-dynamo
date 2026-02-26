@@ -1,22 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Unified fuzzing runner for all fuzz crates in the repository.
-#
+# Unified fuzzing runner. Auto-discovers all fuzz crates under lib/.
 # Usage:
-#   ./fuzzing/run.sh                              # all crates, all targets, 60s each
-#   ./fuzzing/run.sh --crate parsers              # one crate only
-#   ./fuzzing/run.sh --target fuzz_invariants     # one target (auto-detects crate)
-#   FUZZ_TIMEOUT=300 ./fuzzing/run.sh             # 5 min per target
-#
-# Environment variables:
-#   FUZZ_TIMEOUT=60            # seconds per target (default 60)
-#   FUZZ_TIMEOUT_PER_INPUT=10  # seconds per input (catches hangs)
-#   FUZZ_RSS_LIMIT=2048        # MB memory limit (catches OOM/quadratic)
-#   FUZZ_MAX_LEN=65536         # max input size in bytes
-#   FUZZ_OVERFLOW_CHECKS=0     # set to 1 to enable integer overflow detection
-#   FUZZ_CRATE=                # filter to specific crate (parsers|kv-router|tokens|runtime)
-#   FUZZ_TARGET=               # filter to specific target name
+#   ./fuzzing/run.sh                              # all crates, 60s/target
+#   ./fuzzing/run.sh --crate parsers              # one crate
+#   ./fuzzing/run.sh --target fuzz_invariants     # one target
+#   FUZZ_TIMEOUT=300 ./fuzzing/run.sh             # 5 min/target
 
 FUZZ_TIMEOUT="${FUZZ_TIMEOUT:-60}"
 FUZZ_TIMEOUT_PER_INPUT="${FUZZ_TIMEOUT_PER_INPUT:-10}"
@@ -34,7 +24,6 @@ export RUSTUP_HOME="$FUZZ_ENV/rustup"
 export CARGO_HOME="$FUZZ_ENV/cargo"
 export PATH="$CARGO_HOME/bin:$PATH"
 
-# protoc for crates that need it (etcd-client)
 if [ -f "/opt/homebrew/anaconda3/bin/protoc" ]; then
     export PROTOC="/opt/homebrew/anaconda3/bin/protoc"
     export PATH="/opt/homebrew/anaconda3/bin:$PATH"
@@ -42,7 +31,6 @@ elif command -v protoc &>/dev/null; then
     export PROTOC="$(command -v protoc)"
 fi
 
-# Parse CLI arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
         --crate) FUZZ_CRATE="$2"; shift 2 ;;
@@ -56,132 +44,61 @@ if [ ! -f "$CARGO_HOME/bin/rustup" ]; then
     echo "=== Installing rustup (isolated)..."
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain nightly
 fi
-if ! rustup toolchain list | grep -q nightly; then
-    rustup install nightly
-fi
-if ! command -v cargo-fuzz &>/dev/null; then
-    cargo +nightly install cargo-fuzz
-fi
+rustup toolchain list | grep -q nightly || rustup install nightly
+command -v cargo-fuzz &>/dev/null || cargo +nightly install cargo-fuzz
 
-# Enable overflow checks if requested
-if [ "$FUZZ_OVERFLOW_CHECKS" = "1" ]; then
-    export RUSTFLAGS="${RUSTFLAGS:-} -C overflow-checks=yes"
-    echo "=== Overflow checks ENABLED"
-fi
+[ "$FUZZ_OVERFLOW_CHECKS" = "1" ] && export RUSTFLAGS="${RUSTFLAGS:-} -C overflow-checks=yes"
 
-# Auto-discover fuzz crates
-discover_crates() {
-    find "$REPO_ROOT/lib" -path "*/fuzz/Cargo.toml" -maxdepth 3 | sort | while read -r toml; do
-        crate_dir="$(dirname "$(dirname "$toml")")"
-        crate_name="$(basename "$crate_dir")"
-        echo "$crate_name:$crate_dir"
-    done
-}
-
-# Get targets for a fuzz crate
-list_targets() {
-    local crate_dir="$1"
-    find "$crate_dir/fuzz/fuzz_targets" -name "*.rs" -type f 2>/dev/null | while read -r f; do
-        basename "$f" .rs
-    done | sort
-}
-
-# Find dictionary for a crate
-find_dict() {
-    local crate_dir="$1"
-    find "$crate_dir/fuzz" -name "*.dict" -type f 2>/dev/null | head -1
-}
-
-# Find seeds directory for a crate
-find_seeds() {
-    local crate_dir="$1"
-    local seeds_dir="$crate_dir/fuzz/seeds"
-    if [ -d "$seeds_dir" ]; then
-        echo "$seeds_dir"
-    fi
-}
-
-echo "=== Unified Fuzzing Runner"
-echo "=== Config: timeout=${FUZZ_TIMEOUT}s/target, ${FUZZ_TIMEOUT_PER_INPUT}s/input, rss=${FUZZ_RSS_LIMIT}MB, max_len=${FUZZ_MAX_LEN}"
-echo ""
+echo "=== Fuzzing: timeout=${FUZZ_TIMEOUT}s, rss=${FUZZ_RSS_LIMIT}MB, max_len=${FUZZ_MAX_LEN}"
 
 TOTAL_CRASHES=0
 TOTAL_TARGETS=0
-CRATES_RUN=0
 
-while IFS=: read -r crate_name crate_dir; do
-    # Apply crate filter
-    if [ -n "$FUZZ_CRATE" ] && [ "$crate_name" != "$FUZZ_CRATE" ]; then
-        continue
-    fi
+find "$REPO_ROOT/lib" -path "*/fuzz/Cargo.toml" -maxdepth 3 | sort | while read -r toml; do
+    crate_dir="$(dirname "$(dirname "$toml")")"
+    crate_name="$(basename "$crate_dir")"
+    [ -n "$FUZZ_CRATE" ] && [ "$crate_name" != "$FUZZ_CRATE" ] && continue
 
-    fuzz_dir="$crate_dir/fuzz"
-    dict=$(find_dict "$crate_dir")
-    seeds=$(find_seeds "$crate_dir")
-
-    echo "=== Crate: $crate_name ($crate_dir)"
-    CRATES_RUN=$((CRATES_RUN + 1))
-
+    echo ""
+    echo "=== Crate: $crate_name"
     cd "$crate_dir"
 
-    targets=$(list_targets "$crate_dir")
-    crate_crashes=0
+    dict=$(find fuzz -name "*.dict" -type f 2>/dev/null | head -1)
+    seeds_dir="fuzz/seeds"
 
-    for target in $targets; do
-        # Apply target filter
-        if [ -n "$FUZZ_TARGET" ] && [ "$target" != "$FUZZ_TARGET" ]; then
-            continue
-        fi
+    for target_file in fuzz/fuzz_targets/*.rs; do
+        [ -f "$target_file" ] || continue
+        target="$(basename "$target_file" .rs)"
+        [ -n "$FUZZ_TARGET" ] && [ "$target" != "$FUZZ_TARGET" ] && continue
 
         TOTAL_TARGETS=$((TOTAL_TARGETS + 1))
-
-        # Seed corpus directory
         corpus_dir="fuzz/corpus/$target"
         mkdir -p "$corpus_dir"
 
-        # Copy seeds to corpus on first run
-        if [ -n "$seeds" ] && [ "$(find "$corpus_dir" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')" -eq 0 ]; then
-            cp "$seeds"/* "$corpus_dir"/ 2>/dev/null || true
+        # Seed corpus on first run
+        if [ -d "$seeds_dir" ] && [ "$(find "$corpus_dir" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')" -eq 0 ]; then
+            cp "$seeds_dir"/* "$corpus_dir"/ 2>/dev/null || true
         fi
 
-        # Build dict argument
         DICT_ARG=()
-        if [ -n "$dict" ]; then
-            DICT_ARG=("-dict=$dict")
-        fi
+        [ -n "$dict" ] && DICT_ARG=("-dict=$dict")
 
-        echo ""
-        echo "--- [$crate_name/$target] running for ${FUZZ_TIMEOUT}s..."
-
+        echo "--- [$crate_name/$target] ${FUZZ_TIMEOUT}s..."
         cargo +nightly fuzz run "$target" -- \
             -max_total_time="$FUZZ_TIMEOUT" \
             -timeout="$FUZZ_TIMEOUT_PER_INPUT" \
             -rss_limit_mb="$FUZZ_RSS_LIMIT" \
             -max_len="$FUZZ_MAX_LEN" \
-            "${DICT_ARG[@]}" \
-            2>&1 || true
+            "${DICT_ARG[@]}" 2>&1 || true
 
-        # Count crashes
         artifact_dir="fuzz/artifacts/$target"
         count=$(find "$artifact_dir" -type f 2>/dev/null | wc -l | tr -d ' ')
         if [ "$count" -gt 0 ]; then
-            echo "--- [$crate_name/$target] FOUND $count crash(es) in $artifact_dir/"
-            crate_crashes=$((crate_crashes + count))
-        else
-            echo "--- [$crate_name/$target] no crashes"
+            echo "--- [$crate_name/$target] $count crash(es)"
+            TOTAL_CRASHES=$((TOTAL_CRASHES + count))
         fi
     done
-
-    TOTAL_CRASHES=$((TOTAL_CRASHES + crate_crashes))
-    echo ""
-    echo "=== [$crate_name] $crate_crashes crash(es) across targets"
-
-done < <(discover_crates)
+done
 
 echo ""
-echo "============================================"
-echo "=== Summary"
-echo "=== Crates: $CRATES_RUN"
-echo "=== Targets: $TOTAL_TARGETS"
-echo "=== Total crashes: $TOTAL_CRASHES"
-echo "============================================"
+echo "=== Done: $TOTAL_TARGETS targets, $TOTAL_CRASHES crashes"

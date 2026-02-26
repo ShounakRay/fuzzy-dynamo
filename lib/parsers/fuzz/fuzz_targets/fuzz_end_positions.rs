@@ -2,9 +2,6 @@
 use libfuzzer_sys::fuzz_target;
 use dynamo_parsers::*;
 
-// Fuzz find_tool_call_end_position with all parser names.
-// Asserts the returned position is always <= input length (a violation
-// would cause out-of-bounds slicing in callers).
 fuzz_target!(|data: &[u8]| {
     let Ok(s) = std::str::from_utf8(data) else { return };
 

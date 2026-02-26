@@ -2,8 +2,6 @@
 use libfuzzer_sys::fuzz_target;
 use dynamo_parsers::*;
 
-// Fuzz the top-level detect_tool_call_start with all parser names.
-// This exercises the parser registry + each parser's detection logic.
 fuzz_target!(|data: &[u8]| {
     let Ok(s) = std::str::from_utf8(data) else { return };
 
@@ -16,6 +14,5 @@ fuzz_target!(|data: &[u8]| {
     for name in parsers {
         let _ = detect_tool_call_start(s, Some(name));
     }
-    // Also with None (auto-detect path)
     let _ = detect_tool_call_start(s, None);
 });

@@ -4,9 +4,6 @@ use dynamo_parsers::*;
 use dynamo_parsers::tool_calling::config::{DsmlParserConfig, Glm47ParserConfig};
 use dynamo_parsers::tool_calling::xml::try_tool_call_parse_glm47;
 
-// Fuzz parsers with every named config preset.
-// The default-config harness might miss bugs that only trigger with
-// specific start/end token patterns (e.g. deepseek's unicode tokens).
 fuzz_target!(|data: &[u8]| {
     let Ok(s) = std::str::from_utf8(data) else { return };
 

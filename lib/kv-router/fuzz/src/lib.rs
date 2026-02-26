@@ -1,11 +1,8 @@
-//! Shared helpers for KV router fuzz targets.
-
 use dynamo_kv_router::protocols::{
     ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheRemoveData, KvCacheStoreData,
     KvCacheStoredBlockData, LocalBlockHash, RouterEvent,
 };
 
-/// Build a store event from fuzz bytes.
 pub fn make_store_event(
     worker_id: u64,
     event_id: u64,
@@ -32,7 +29,6 @@ pub fn make_store_event(
     }
 }
 
-/// Build a remove event from fuzz bytes.
 pub fn make_remove_event(worker_id: u64, event_id: u64, hashes: &[u64]) -> RouterEvent {
     RouterEvent {
         worker_id,
@@ -49,7 +45,6 @@ pub fn make_remove_event(worker_id: u64, event_id: u64, hashes: &[u64]) -> Route
     }
 }
 
-/// Build a clear event.
 pub fn make_clear_event(worker_id: u64, event_id: u64) -> RouterEvent {
     RouterEvent {
         worker_id,
@@ -61,9 +56,6 @@ pub fn make_clear_event(worker_id: u64, event_id: u64) -> RouterEvent {
     }
 }
 
-/// State tracker for fuzz event loops.
-/// Tracks stored hashes per worker so we can build valid parent refs
-/// and valid remove targets.
 pub struct FuzzEventState {
     pub pos: usize,
     pub event_id: u64,
@@ -79,8 +71,6 @@ impl FuzzEventState {
         }
     }
 
-    /// Parse the next operation from fuzz data. Returns None if data exhausted.
-    /// Returns (op_type, worker_id, event) where op_type is 0=store, 1=remove, 2=clear, 3=query.
     pub fn next_event(&mut self, data: &[u8]) -> Option<(u8, u64, FuzzOp)> {
         if self.pos >= data.len() {
             return None;
@@ -96,7 +86,6 @@ impl FuzzEventState {
         let op_type = op_byte % 4;
         match op_type {
             0 => {
-                // Store: read 1-4 block hashes
                 let count = if self.pos < data.len() {
                     (data[self.pos] % 4) as usize + 1
                 } else {
@@ -127,7 +116,6 @@ impl FuzzEventState {
                 Some((op_type, worker_id, FuzzOp::Event(event)))
             }
             1 => {
-                // Remove
                 if let Some(worker_hashes) = self.stored.get_mut(&worker_id) {
                     if !worker_hashes.is_empty() {
                         let idx = if self.pos < data.len() {
@@ -145,14 +133,12 @@ impl FuzzEventState {
                 Some((op_type, worker_id, FuzzOp::Skip))
             }
             2 => {
-                // Clear
                 let event = make_clear_event(worker_id, self.event_id);
                 self.stored.remove(&worker_id);
                 self.event_id += 1;
                 Some((op_type, worker_id, FuzzOp::Event(event)))
             }
             3 => {
-                // Query
                 let count = if self.pos < data.len() {
                     (data[self.pos] % 8) as usize + 1
                 } else {
@@ -185,7 +171,6 @@ impl FuzzEventState {
     }
 }
 
-/// Fuzz operation result.
 pub enum FuzzOp {
     Event(RouterEvent),
     Query(Vec<LocalBlockHash>, bool),
