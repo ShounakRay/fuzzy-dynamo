@@ -144,15 +144,27 @@ Uses `message.content[0]` (panics on empty) while the commentary branch correctl
 
 ## KV Router Fuzz Targets (Phase 1)
 
-### Identified High-Probability Crash Paths
+### Bug 15: `compute_block_hash_for_seq` panics on `kv_block_size=0` (High) — CONFIRMED BY FUZZER
 
-1. **`compute_block_hash_for_seq(kv_block_size=0)`**: Calls `tokens.chunks_exact(0)` which panics. This is the highest-confidence new bug — any request with `kv_block_size=0` will crash the router.
+**File**: `lib/kv-router/src/protocols.rs`
 
-2. **`RequestExtraInfo::to_block_level(block_size=0)`**: Division by zero in `req_start / block_size`. Same class as upstream issue [#3112](https://github.com/ai-dynamo/dynamo/issues/3112) (planner division by zero).
+**Crash artifact**: `lib/kv-router/fuzz/artifacts/fuzz_block_hash_computation/crash-7722745105e9e02e8f1aaf17f7b3aac5c56cd805`
 
-3. **`PositionalIndexer::new(jump_size=0)`**: If `jump_size=0` is accepted, later `chunks_exact(0)` calls will panic.
+**Reproducer**: 6 bytes of zeros → `kv_block_size = 0` → `tokens.chunks_exact(0)` → panic.
 
-**Validation**: Items 1-2 are **very likely real bugs** — the functions accept `u32` parameters with no zero-check, and `chunks_exact(0)` / division by zero are well-known Rust panics. Item 3 needs runtime verification. These match the pattern of upstream issue [#3112](https://github.com/ai-dynamo/dynamo/issues/3112).
+**How found**: `fuzz_block_hash_computation` found this crash within seconds. The fuzzer generated input `[0,0,0,0,0,0]` which sets `kv_block_size=0` (bytes 0-3) and triggers `chunks_exact(0)` in `compute_block_hash_for_seq`.
+
+**Impact**: Any KV cache request with `kv_block_size=0` will crash the router process. This is a denial-of-service vulnerability since the parameter comes from configuration/external input.
+
+**Validation**: **Confirmed real bug via fuzzer crash.** The function accepts a `u32` parameter with no zero-check. `chunks_exact(0)` is a well-documented panic in Rust's standard library.
+
+**Fix direction**: Add `if kv_block_size == 0 { return vec![]; }` guard at function entry.
+
+### High-Probability Crash Paths (Not Yet Runtime-Confirmed)
+
+1. **`RequestExtraInfo::to_block_level(block_size=0)`**: Division by zero in `req_start / block_size`. Same class as upstream issue [#3112](https://github.com/ai-dynamo/dynamo/issues/3112) (planner division by zero). Could not be runtime-confirmed due to disk space constraints during fuzzing.
+
+2. **`PositionalIndexer::new(jump_size=0)`**: If `jump_size=0` is accepted, later `chunks_exact(0)` calls will panic.
 
 ### State Machine Fuzzing (`fuzz_radix_tree_events`)
 
@@ -268,14 +280,26 @@ No existing upstream issues or PRs reference fuzzing. This is the **first fuzzin
 
 ---
 
-## Run Statistics (Parser Phase)
+## Run Statistics
 
-| Harness | Duration | Executions | Coverage (edges) | Crashes |
-|---------|----------|------------|------------------|---------|
-| `fuzz_invariants` | 5 min | 317,428 | 7,730 | 0 |
-| `fuzz_differential` | ~10s | ~90 | 6,629 | 1 (Mistral prefix bug) |
-| `fuzz_redos` | 10s | 128,718 | 3,388 | 0 |
-| `fuzz_with_tools` | 10s | 114,685 | 425 | 0 |
+### Parser Phase (original)
+
+| Harness | Duration | Executions | Crashes |
+|---------|----------|------------|---------|
+| `fuzz_invariants` | 5 min | 317,428 | 0 |
+| `fuzz_differential` | ~10s | ~90 | 1 (Mistral prefix bug) |
+| `fuzz_redos` | 10s | 128,718 | 0 |
+| `fuzz_with_tools` | 10s | 114,685 | 0 |
+
+### Extended Phase (new targets)
+
+| Harness | Duration | Executions | Crashes |
+|---------|----------|------------|---------|
+| `fuzz_block_hash_computation` (kv-router) | ~30s | — | 1 (kv_block_size=0 panic) |
+| `fuzz_content_preservation` (parsers) | 60s | 344,376 | 0 |
+| `fuzz_streaming_monotonicity` (parsers) | 60s | 35,858 | 0 |
+| `fuzz_token_block_sequence` (tokens) | 60s | 238,803 | 0 |
+| `fuzz_request_extra_info` (kv-router) | — | — | Build failed (disk space) |
 
 ---
 
