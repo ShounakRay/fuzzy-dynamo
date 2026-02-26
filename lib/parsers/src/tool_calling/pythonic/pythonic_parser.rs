@@ -371,6 +371,34 @@ mod detect_parser_tests {
     use super::*;
 
     #[test]
+    fn test_parse_pythonic_normal_text_after_tool_call_preserved() {
+        // BUG: split(&matches[0]).next() only returns text BEFORE the first match.
+        // Text after the tool call is silently dropped.
+        let message = "Before [foo(a=1)] After";
+        let (result, content) = try_tool_call_parse_pythonic(message, None).unwrap();
+        assert_eq!(result.len(), 1);
+        let normal = content.unwrap();
+        assert!(
+            normal.contains("After"),
+            "Text after tool call is silently dropped. Got: {:?}",
+            normal
+        );
+    }
+
+    #[test]
+    fn test_parse_pythonic_zero_arg_function_call() {
+        // BUG: The regex requires at least one key=value argument.
+        // Zero-argument function calls like [get_time()] don't match.
+        let message = "[get_time()]";
+        let (result, _) = try_tool_call_parse_pythonic(message, None).unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "Zero-argument pythonic tool calls should be parsed but the regex rejects them"
+        );
+    }
+
+    #[test]
     fn test_detect_tool_call_start_pythonic_chunk_with_tool_call_start_token() {
         let text = r#"[foo(a=1, b=2), bar(x=3)]"#;
         let result = detect_tool_call_start_pythonic(text);

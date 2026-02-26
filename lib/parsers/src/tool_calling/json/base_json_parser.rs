@@ -385,6 +385,58 @@ pub fn detect_tool_call_start_basic_json(chunk: &str, config: &JsonParserConfig)
 }
 
 #[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    #[test]
+    fn test_text_after_tool_call_is_preserved() {
+        // BUG: try_parse_normal_text() only extracts text BEFORE the start token
+        // (via input[..idx].trim()). Text appearing AFTER the tool call end token
+        // is silently dropped because it's never extracted.
+        let text = r#"Before <tool_call>{"name": "search", "parameters": {"query": "rust"}}</tool_call> After"#;
+        let config = JsonParserConfig {
+            tool_call_start_tokens: vec!["<tool_call>".to_string()],
+            tool_call_end_tokens: vec!["</tool_call>".to_string()],
+            ..Default::default()
+        };
+
+        let (calls, normal_text) =
+            try_tool_call_parse_basic_json(text, &config, None).unwrap();
+        assert_eq!(calls.len(), 1);
+
+        let normal = normal_text.unwrap();
+        assert!(
+            normal.contains("After"),
+            "Text after tool call end token is silently dropped. Got: {:?}",
+            normal
+        );
+    }
+
+    #[test]
+    fn test_text_after_tool_call_single_token() {
+        // Same bug with single-token (no end token) parsers like Mistral
+        let text = r#"Here is the result: [TOOL_CALLS]{"name": "get_weather", "parameters": {"location": "NYC"}}
+The weather is nice."#;
+        let config = JsonParserConfig {
+            tool_call_start_tokens: vec!["[TOOL_CALLS]".to_string()],
+            tool_call_end_tokens: vec!["".to_string()],
+            ..Default::default()
+        };
+
+        let (calls, normal_text) =
+            try_tool_call_parse_basic_json(text, &config, None).unwrap();
+        assert_eq!(calls.len(), 1);
+
+        let normal = normal_text.unwrap();
+        assert!(
+            normal.contains("weather is nice"),
+            "Text after single-token tool call is silently dropped. Got: {:?}",
+            normal
+        );
+    }
+}
+
+#[cfg(test)]
 mod detect_parser_tests {
     use super::*;
 

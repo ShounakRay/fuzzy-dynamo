@@ -468,6 +468,40 @@ mod tests {
             Some("I'll help you understand this Xiaohongshu codebase. Let me start by exploring the structure\n  and key files to provide you with a comprehensive\n  explanation.".to_string())
         );
     }
+
+    #[test]
+    fn test_json_normalization_preserves_newlines_in_string_values() {
+        // BUG: When initial JSON parse fails, the fallback normalization joins
+        // lines with spaces, corrupting string values that contain intentional
+        // newlines. E.g., a code snippet "def f():\n    pass" becomes
+        // "def f(): pass".
+        //
+        // The normalization at lines 115-119 does:
+        //   .lines().map(|line| line.trim_start()).collect::<Vec<_>>().join(" ")
+        // which destroys newlines and indentation in string values.
+        let config = match ToolCallConfig::deepseek_v3().parser_config {
+            super::super::config::ParserConfig::Json(cfg) => cfg,
+            _ => panic!("Expected JSON parser config"),
+        };
+
+        // Simulate a tool call with a code argument containing newlines.
+        // The JSON has an unescaped newline in the string (malformed),
+        // triggering the normalization fallback.
+        let text = "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>write_file\n{\"path\": \"/tmp/test.py\",\n\"content\": \"def hello():\\n    print('hi')\"}\n<｜tool▁call▁end｜><｜tool▁calls▁end｜>";
+
+        let (result, _) = parse_tool_calls_deepseek_v3(text, &config, None).unwrap();
+        if !result.is_empty() {
+            let args: serde_json::Value =
+                serde_json::from_str(&result[0].function.arguments).unwrap();
+            if let Some(content) = args["content"].as_str() {
+                assert!(
+                    content.contains("\\n"),
+                    "JSON normalization should preserve escaped newlines in string values, got: {:?}",
+                    content
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
