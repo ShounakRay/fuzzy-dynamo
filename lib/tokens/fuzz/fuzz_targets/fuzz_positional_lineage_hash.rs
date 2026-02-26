@@ -19,20 +19,9 @@ fuzz_target!(|data: &[u8]| {
         Some(parent_hash_raw)
     };
 
-    let position = position_raw as u64;
-
-    // Position >= 2^24 should panic — test this boundary
-    if position >= (1u64 << 24) {
-        let result = std::panic::catch_unwind(|| {
-            PositionalLineageHash::new(current_hash, parent_hash, position)
-        });
-        assert!(
-            result.is_err(),
-            "expected panic for position {} >= 2^24",
-            position
-        );
-        return;
-    }
+    // Position >= 2^24 is intentionally rejected with panic by the API.
+    // Filter it out since catch_unwind doesn't work under ASAN.
+    let position = (position_raw as u64) % (1u64 << 24);
 
     let plh = PositionalLineageHash::new(current_hash, parent_hash, position);
 
