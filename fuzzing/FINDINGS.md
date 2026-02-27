@@ -2,7 +2,7 @@
 
 ## Overview
 
-Comprehensive fuzzing infrastructure covering 5 crates with 27 fuzz targets and 4 regression test modules (79 tests). Found **7 confirmed crash bugs via fuzzing** and **14 bugs via code audit** across 4 crates. All crash bugs are reproducible with minimal inputs.
+Comprehensive fuzzing infrastructure covering 5 crates with 29 fuzz targets and 4 regression test modules (79 tests). Found **7 confirmed crash bugs via fuzzing** and **14 bugs via code audit** across 4 crates. All crash bugs are reproducible with minimal inputs.
 
 **Audit Verdicts** (after reviewing source code, tests, and documentation):
 
@@ -73,7 +73,9 @@ if kv_block_size == 0 {
 **Severity**: High — DoS via KV cache events
 **How found**: Fuzzing (`fuzz_radix_tree_events`)
 **File**: `lib/kv-router/src/radix_tree.rs`, lines 361-371
-**Crash artifact**: `lib/kv-router/fuzz/artifacts/fuzz_radix_tree_events/crash-0a2d64ba6898a5b06f8a7f1cba83f36e0aa85944`
+**Crash artifacts**:
+- `lib/kv-router/fuzz/artifacts/fuzz_radix_tree_events/crash-0a2d64ba6898a5b06f8a7f1cba83f36e0aa85944`
+- `lib/kv-router/fuzz/artifacts/fuzz_radix_tree_events/crash-0fd4bb27dcbbc0cdd017d8ae7ae2f1601c2a86b6`
 
 **What it is**: The `worker_lookup` hash map caches `Rc<RefCell<RadixBlock>>` by `ExternalSequenceBlockHash`. When store events create sequences with duplicate block hashes (e.g., multiple blocks all hashing to the same value), the same `Rc` gets reused. This creates a situation where a node and its child are the same object. At line 361, `current.borrow_mut()` takes a mutable borrow on the parent. Then at line 371, `block.borrow()` tries to immutably borrow what turns out to be the same `RefCell` — triggering a `RefCell already mutably borrowed` panic.
 
@@ -212,7 +214,9 @@ let total_len = 24usize
 **How found**: Fuzzing (`fuzz_differential`)
 **Verdict**: Debatable — the streaming path cannot trim mid-stream since more data may follow. Streaming and one-shot have legitimately different contracts regarding trailing whitespace. This is a conscious trade-off rather than a bug.
 **File**: `lib/parsers/src/reasoning/minimax_append_think_parser.rs` (via `BasicReasoningParser` in `base_parser.rs` lines 139-140 vs 253-254)
-**Crash artifact**: `lib/parsers/fuzz/artifacts/fuzz_differential/crash-3f3d2d8955322f325af6db2238355fa07007ebd9`
+**Crash artifacts**:
+- `lib/parsers/fuzz/artifacts/fuzz_differential/crash-3f3d2d8955322f325af6db2238355fa07007ebd9`
+- `lib/parsers/fuzz/artifacts/fuzz_differential/crash-619bb763e6dacf19a16dfd47e28b9821bdd8176c`
 
 **What it is**: The one-shot `detect_and_parse_reasoning` applies `.trim()` to outputs:
 ```rust
@@ -235,8 +239,11 @@ cargo +nightly fuzz run fuzz_differential \
   fuzz/artifacts/fuzz_differential/crash-3f3d2d8955322f325af6db2238355fa07007ebd9
 ```
 The 4-byte input `[10, 10, 10, 10]` decodes to: parser selector byte `10` = MiniMaxAppendThink, payload = `"\n\n"`.
+The 3-byte input `[142, 205, 10]` decodes to: parser selector byte `142 % 11 = 10` = MiniMaxAppendThink, chunk strategy 1, payload = `"\n"`.
 
-**Assertion failure**: `Reasoning mismatch for MiniMaxAppendThink (cs=2). Input: "\n\n" — One-shot: "" — Streaming: "\n\n"`
+**Assertion failures**:
+- `Reasoning mismatch for MiniMaxAppendThink (cs=2). Input: "\n\n" — One-shot: "" — Streaming: "\n\n"`
+- `Reasoning mismatch for MiniMaxAppendThink (cs=1). Input: "\n" — One-shot: "" — Streaming: "\n"`
 
 **How to fix**: Either remove `.trim()` from the one-shot path (preserving raw content to match streaming) or add trimming to the streaming path's final output. Removing from one-shot is safer since it avoids changing streaming behavior mid-stream.
 
@@ -639,6 +646,8 @@ The original 9 parser fuzz targets only check "doesn't crash" — they call pars
 | `fuzz_request_extra_info` | Boundary/crash | Multimodal offset splitting with edge-case params | Bug 17 |
 | `fuzz_block_hash_computation` | Crash | Hash computation with zero/extreme params | Bug 15 |
 | `fuzz_two_part_decode` | Crash | Network codec decode with arbitrary bytes | Bug 18 |
+| `fuzz_tool_call_roundtrip` | Round-trip | Generate valid tool calls, verify name/args survive parsing | 0 (validates correctness) |
+| `fuzz_radix_tree_consistency` | Consistency oracle | Store blocks, verify exact scores and worker removal | 0 (validates correctness) |
 
 The differential fuzzer found real bugs almost immediately with 1-4 byte inputs. The state machine fuzzer found the RefCell cycle with a 10-byte input.
 
@@ -646,18 +655,43 @@ The differential fuzzer found real bugs almost immediately with 1-4 byte inputs.
 
 ## Upstream Issue Correlation
 
-| Our Finding | Upstream Issue | Match |
-|-------------|----------------|-------|
-| Bug 18: TCP codec overflow | [#6147](https://github.com/ai-dynamo/dynamo/issues/6147) TCP panic on ConnectionReset | Direct |
-| Bug 17: Division by zero | [#3112](https://github.com/ai-dynamo/dynamo/issues/3112) Planner division by zero | Same class |
-| Bug 20: Parser content loss | [#3393](https://github.com/ai-dynamo/dynamo/issues/3393) "loss of tokens" in parser | Validates |
-| Missing input validation | [#6605](https://github.com/ai-dynamo/dynamo/issues/6605) Oversized prompts crash as 500 | Same class |
-| Serde deserialization | [#5866](https://github.com/ai-dynamo/dynamo/issues/5866) empty/malformed metadata | Same class |
-| Memory exhaustion | [#5275](https://github.com/ai-dynamo/dynamo/issues/5275) Memory leak under load | Same class |
+All bugs verified against `upstream/main` as of 2026-02-26. None have been fixed.
 
-**Novelty**: 7 of 8 bug categories are NOVEL (no upstream reports). No existing fuzzing infrastructure exists upstream — this is the first.
+### Novel bugs (ranked by severity)
 
-**Post-audit note**: Bugs 12/13 were already fixed upstream. Bugs 5, 10, 19 are debatable trade-offs. The remaining 15 bugs are confirmed real.
+| Bug | Severity | Type | Novelty | Upstream Reference |
+|-----|----------|------|---------|-------------------|
+| **18 (TwoPartCodec overflow)** | **Critical** | **Security: integer overflow → memory corruption** | **Novel** | **No upstream issue exists** |
+| 8 (GLM-4.7 UTF-8 panic) | High | Crash (panic) | Novel | No prior reports |
+| 11 (strip_quotes panic) | High | Crash (panic) | Novel | No prior reports |
+| 17 (div by zero) | High | Crash / DoS | Novel (distinct crash site) | Related to Bug 15 area but different function |
+| 3, 4 (DSML parser) | Medium | Silent data loss | Novel | PR #4822 introduced the feature but missed these |
+| 7 (try_literal_eval corruption) | Medium | Data corruption | Novel | No prior reports |
+| 5 (newline destruction) | Medium (debatable) | Data corruption | Novel | PR #6294 fixed a different newline issue (template loading, not JSON normalization) |
+| 6 (pythonic text drop) | Low | Silent data loss | Novel | No prior reports |
+| 9 (base JSON text drop) | Low | Silent data loss | Novel | No prior reports |
+| 19 (MiniMax trim asymmetry) | Low (debatable) | Behavioral divergence | Novel | No prior reports |
+| 10 (Kimi K2 OnceLock) | Low (debatable) | Logic error | Novel | No prior reports |
+
+### Known / partially known bugs (ranked by severity, then novelty)
+
+| Bug | Severity | Type | Novelty | Upstream Reference |
+|-----|----------|------|---------|-------------------|
+| 15 (chunks_exact zero) | High | Crash / DoS | Known but unfixed | [#1589](https://github.com/ai-dynamo/dynamo/issues/1589) exact match, closed as stale — fuzzing proves still there |
+| 16 (RefCell reentrant borrow) | High | Crash / DoS | Known, partially addressed | [#3765](https://github.com/ai-dynamo/dynamo/issues/3765) + PR #5973 replaced RefCell with RwLock in concurrent path, old path still vulnerable |
+| 20 (streaming token loss) | Medium | Silent data loss | Partially known | [#3393](https://github.com/ai-dynamo/dynamo/issues/3393) mentions "loss of tokens" generally |
+| 14 (harmony content[0]) | Latent | Crash (panic) | Partially known | [#3393](https://github.com/ai-dynamo/dynamo/issues/3393) acknowledges parser unreliability generally |
+| 12, 13 (UTF-8 start tokens) | ~~High~~ N/A | ~~Crash (panic)~~ | Already fixed | Character-based iteration refactor |
+
+**Summary**: 11 entirely novel, 3 partially known, 2 previously known (but still unfixed). No existing upstream PR fixes any of these. The fuzzing infrastructure itself is also entirely novel — no prior fuzzing work exists in the repo.
+
+### Related upstream issues (not direct matches)
+
+| Upstream Issue | Relation |
+|----------------|----------|
+| [#6605](https://github.com/ai-dynamo/dynamo/issues/6605) Oversized prompts crash as 500 | Same class as missing input validation |
+| [#5866](https://github.com/ai-dynamo/dynamo/issues/5866) empty/malformed metadata | Same class as serde deserialization bugs |
+| [#5275](https://github.com/ai-dynamo/dynamo/issues/5275) Memory leak under load | Same class as unbounded allocation risks |
 
 ---
 
@@ -665,8 +699,8 @@ The differential fuzzer found real bugs almost immediately with 1-4 byte inputs.
 
 | Crate | Targets | Technique | Runs | Crashes |
 |-------|---------|-----------|------|---------|
-| `dynamo-parsers` | 15 | Crash, invariant, differential, ReDoS, streaming monotonicity, content preservation | ~12.6M | 3 |
-| `dynamo-kv-router` | 5 | State machine, crash, round-trip, JSON deserialization, boundary | ~1.4M | 3 |
+| `dynamo-parsers` | 16 | Crash, invariant, differential, ReDoS, streaming monotonicity, content preservation, round-trip | ~13.5M | 3 |
+| `dynamo-kv-router` | 6 | State machine, crash, round-trip, JSON deserialization, boundary, consistency oracle | ~1.7M | 3 |
 | `dynamo-tokens` | 3 | Round-trip, boundary, stateful invariant | ~77.8M | 0 |
 | `dynamo-runtime` | 4 | Crash, round-trip | ~48M | 1 |
 | `dynamo-llm` | 4 modules | Regression tests (SSE codec, DeepSeek V3.2, OpenAI validation, Tensor) | 79 tests | N/A |
@@ -675,15 +709,16 @@ The differential fuzzer found real bugs almost immediately with 1-4 byte inputs.
 
 ## Run Statistics — Full Campaign
 
-### KV Router (5 targets)
+### KV Router (6 targets)
 
 | Harness | Duration | Executions | Crashes | Status |
 |---------|----------|------------|---------|--------|
 | `fuzz_block_hash_computation` | 60s | — | 1 (kv_block_size=0) | CRASH |
-| `fuzz_radix_tree_events` | 120s | — | 1 (RefCell reentrant borrow) | CRASH |
+| `fuzz_radix_tree_events` | 120s+600s | — | 2 (RefCell reentrant borrow) | CRASH |
 | `fuzz_request_extra_info` | 120s | — | 2 (block_size=0 div-by-zero) | CRASH |
 | `fuzz_positional_indexer` | 121s | 407,854 | 0 | Clean |
 | `fuzz_kv_protocol_json` | 121s | 553,647 | 0 | Clean |
+| `fuzz_radix_tree_consistency` | 600s | ~220,000 | 0 | Clean |
 
 ### Runtime Codecs (4 targets)
 
@@ -702,14 +737,14 @@ The differential fuzzer found real bugs almost immediately with 1-4 byte inputs.
 | `fuzz_positional_lineage_hash` | 121s | 20,477,402 | 0 | Clean |
 | `fuzz_token_block_sequence` | 181s | 2,645,757 | 0 | Clean |
 
-### Parsers (15 targets)
+### Parsers (16 targets)
 
 | Harness | Duration | Executions | Crashes | Status |
 |---------|----------|------------|---------|--------|
-| `fuzz_differential` | 300s | — | 2 (Mistral prefix, MiniMax trim) | CRASH |
-| `fuzz_content_preservation` | 301s | 1,036,806 | 0 | Clean |
-| `fuzz_streaming_monotonicity` | 301s | 94,378 | 0 | Clean |
-| `fuzz_invariants` | 181s | 239,979 | 0 | Clean |
+| `fuzz_differential` | 300s+600s | — | 3 (Mistral prefix, MiniMax trim x2) | CRASH |
+| `fuzz_content_preservation` | 301s+600s | ~1,290,000 | 0 | Clean |
+| `fuzz_streaming_monotonicity` | 301s+600s | ~122,000 | 0 | Clean |
+| `fuzz_invariants` | 181s+600s | ~431,000 | 0 | Clean |
 | `fuzz_redos` | 181s | 1,083,777 | 0 | Clean |
 | `fuzz_streaming_reasoning` | 181s | 23,053 | 0 | Clean |
 | `fuzz_reasoning_parsers` | 181s | 29,760 | 0 | Clean |
@@ -721,16 +756,43 @@ The differential fuzzer found real bugs almost immediately with 1-4 byte inputs.
 | `fuzz_deepseek_parsers` | 181s | 1,135,673 | 0 | Clean |
 | `fuzz_parser_configs` | 121s | 526,381 | 0 | Clean |
 | `fuzz_structured_configs` | 121s | 307,928 | 0 | Clean |
+| `fuzz_tool_call_roundtrip` | 600s | ~125,000 | 0 | Clean |
+
+---
+
+## Security Assessment
+
+### Critical: Bug 18 — TwoPartCodec integer overflow (CVE-worthy)
+
+Bug 18 is a **security vulnerability**, not just a reliability bug. The TwoPartCodec is the network-facing message decoder for dynamo's inter-process TCP communication. An unauthenticated peer on the network can exploit it:
+
+1. **Attack vector**: Send a crafted 24-byte TCP message header with large `header_len` / `body_len` values
+2. **Debug builds**: Panics with `attempt to add with overflow` — denial of service (server crash)
+3. **Release builds**: The overflow wraps silently to a small value. This **bypasses the `max_message_size` check** at lines 61-64, since the wrapped `total_len` appears small. The codec then attempts to read `header_len + body_len` bytes from a buffer that is far too small — potential out-of-bounds read, memory disclosure, or memory corruption.
+
+**No upstream issue exists for this.** GitHub issue search for "TwoPartCodec", "integer overflow codec", and "two_part overflow" returned zero results. The related issue #6147 is about a different bug (TCP `ConnectionReset` error handling).
+
+**Recommendation**: This should be reported via private security disclosure (if ai-dynamo/dynamo has a SECURITY.md policy) rather than a public GitHub issue.
+
+### DoS-exploitable bugs
+
+| Bug | Attack Surface | Trigger |
+|-----|---------------|---------|
+| 15 | Config API | `kv_block_size=0` in request |
+| 16 | KV cache events | Duplicate block hashes from adversarial sequences |
+| 17 | Config/request API | `block_size=0` in multimodal request |
+| 11 | Model output | Single-quote character in tool call argument |
+| 8 | Model output | Non-ASCII content in GLM-4.7 function name |
 
 ---
 
 ## File Inventory
 
 ### Fuzz Crates
-- `lib/kv-router/fuzz/` — 5 targets, shared lib, dictionary, seeds, 4 crash artifacts
+- `lib/kv-router/fuzz/` — 6 targets, shared lib, dictionary, seeds, 4 crash artifacts
 - `lib/tokens/fuzz/` — 3 targets, dictionary, adversarial seeds
 - `lib/runtime/fuzz/` — 4 targets, dictionary, adversarial seeds, 1 crash artifact
-- `lib/parsers/fuzz/` — 15 targets, shared lib, 2 crash artifacts
+- `lib/parsers/fuzz/` — 16 targets, shared lib, 3 crash artifacts
 
 ### LLM Regression Tests
 - `lib/llm/src/protocols/codec.rs` — 10 tests
