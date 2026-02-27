@@ -96,3 +96,8 @@ doc = false
 name = "fuzz_streaming_monotonicity"
 path = "fuzz_targets/fuzz_streaming_monotonicity.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_tool_call_roundtrip"
+path = "fuzz_targets/fuzz_tool_call_roundtrip.rs"
+doc = false
