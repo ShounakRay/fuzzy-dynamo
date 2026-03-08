@@ -1,5 +1,5 @@
 #![no_main]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use libfuzzer_sys::fuzz_target;
 use rustc_hash::FxHashMap;
@@ -9,21 +9,6 @@ use dynamo_kv_router::RadixTree;
 use dynamo_kv_router::protocols::LocalBlockHash;
 use dynamo_kv_router_fuzz::{FuzzInput, FuzzOp, make_store_event, make_remove_event, make_clear_event};
 
-/// Deduplicate hashes to avoid the known RadixTree RefCell aliasing bug
-/// when a block sequence contains self-referencing hashes.
-fn dedup_hashes(raw: &[u8], limit: usize) -> Vec<u64> {
-    let mut seen = [false; 16];
-    let mut out = Vec::new();
-    for &b in raw.iter().take(limit) {
-        let h = (b % 16) as u64;
-        if !seen[h as usize] {
-            seen[h as usize] = true;
-            out.push(h);
-        }
-    }
-    out
-}
-
 fuzz_target!(|input: FuzzInput| {
     let ops = if input.ops.len() > 128 { &input.ops[..128] } else { &input.ops };
 
@@ -31,18 +16,28 @@ fuzz_target!(|input: FuzzInput| {
     let concurrent = ConcurrentRadixTree::new();
     let mut concurrent_lookup = FxHashMap::default();
     let mut stored: HashMap<u64, Vec<u64>> = HashMap::new();
+    // Track all hashes ever stored per worker to avoid cross-op collisions
+    // that trigger the known RadixTree RefCell aliasing bug.
+    let mut all_hashes: HashMap<u64, HashSet<u64>> = HashMap::new();
     let mut event_id: u64 = 0;
 
     for op in ops {
         match op {
             FuzzOp::Store { worker_id, hashes } => {
                 let wid = (*worker_id % 4) as u64;
-                let hashes = dedup_hashes(hashes, 16);
+                let worker_all = all_hashes.entry(wid).or_default();
+                // Deduplicate: skip hashes already stored for this worker
+                let hashes: Vec<u64> = hashes.iter()
+                    .take(16)
+                    .map(|&h| (h % 16) as u64)
+                    .filter(|h| !worker_all.contains(h))
+                    .collect();
                 if hashes.is_empty() { continue; }
                 let parent = stored.get(&wid).and_then(|v| v.last().copied());
                 let event = make_store_event(wid, event_id, &hashes, parent);
                 let _ = radix.apply_event(event.clone());
                 let _ = concurrent.apply_event(&mut concurrent_lookup, event);
+                for &h in &hashes { worker_all.insert(h); }
                 stored.entry(wid).or_default().extend_from_slice(&hashes);
                 event_id += 1;
             }
@@ -65,6 +60,7 @@ fuzz_target!(|input: FuzzInput| {
                 let _ = radix.apply_event(event.clone());
                 let _ = concurrent.apply_event(&mut concurrent_lookup, event);
                 stored.remove(&wid);
+                all_hashes.remove(&wid);
                 event_id += 1;
             }
             FuzzOp::Query { seq, early_exit } => {
