@@ -1,15 +1,23 @@
 #![no_main]
+use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use dynamo_parsers::*;
 use dynamo_parsers::tool_calling::config::DsmlParserConfig;
 use dynamo_parsers::tool_calling::json::{JsonParserConfig, JsonParserType, parse_tool_calls_deepseek_v3};
 
-fuzz_target!(|data: &[u8]| {
-    if data.len() < 3 { return; }
-    let depth = (data[0] as usize % 64) + 1;
-    let Ok(payload) = std::str::from_utf8(&data[2..]) else { return };
+#[derive(Debug, Arbitrary)]
+struct FuzzInput {
+    depth: u8,
+    variant: u8,
+    payload: String,
+}
 
-    match data[1] % 6 {
+fuzz_target!(|input: FuzzInput| {
+    let depth = (input.depth as usize % 64) + 1;
+    let payload = &input.payload;
+    if payload.is_empty() { return; }
+
+    match input.variant % 6 {
         0 => {
             let mut s = String::with_capacity(depth * 40 + payload.len());
             for _ in 0..depth { s.push_str(r#"{"name":"f","arguments":{"x":"#); }

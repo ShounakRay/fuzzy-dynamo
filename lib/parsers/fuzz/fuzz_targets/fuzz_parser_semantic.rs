@@ -1,4 +1,5 @@
 #![no_main]
+use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use dynamo_parsers::*;
 use dynamo_parsers::tool_calling::config::DsmlParserConfig;
@@ -7,22 +8,26 @@ use dynamo_parsers::tool_calling::json::{
     parse_tool_calls_deepseek_v3,
 };
 
+#[derive(Debug, Arbitrary)]
+struct FuzzInput {
+    test_case: u8,
+    split_pos: u8,
+    text: String,
+}
+
 /// Round-trip semantic oracle — embeds known-valid tool calls into
 /// fuzz-controlled surrounding text and verifies extraction correctness.
 ///
 /// Bug-specific regression tests live in each parser's #[cfg(test)] module.
-fuzz_target!(|data: &[u8]| {
-    if data.len() < 5 { return; }
-    let Ok(text) = std::str::from_utf8(&data[3..]) else { return };
+fuzz_target!(|input: FuzzInput| {
+    let text = &input.text;
     if text.is_empty() { return; }
 
-    let selector = data[0];
-
-    let mut split = (data[1] as usize) % (text.len() + 1);
+    let mut split = (input.split_pos as usize) % (text.len() + 1);
     while split < text.len() && !text.is_char_boundary(split) { split += 1; }
     let (pfx, sfx) = text.split_at(split);
 
-    match selector % 5 {
+    match input.test_case % 5 {
         // --- Round-trip: XML ---
         0 => {
             let input = format!(

@@ -1,4 +1,5 @@
 #![no_main]
+use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use dynamo_parsers::*;
 use dynamo_parsers::tool_calling::config::{DsmlParserConfig, Glm47ParserConfig};
@@ -8,19 +9,26 @@ use dynamo_parsers::tool_calling::json::{
     parse_tool_calls_deepseek_v3, parse_tool_calls_deepseek_v3_1,
 };
 
+#[derive(Debug, Arbitrary)]
+struct FuzzInput {
+    variant: u8,
+    split: u8,
+    text: String,
+}
+
 fn char_boundary(s: &str, pos: usize) -> usize {
     let mut i = pos.min(s.len());
     while i > 0 && !s.is_char_boundary(i) { i -= 1; }
     i
 }
 
-fuzz_target!(|data: &[u8]| {
-    if data.len() < 4 { return; }
-    let Ok(s) = std::str::from_utf8(&data[4..]) else { return };
+fuzz_target!(|input: FuzzInput| {
+    let s = &input.text;
+    if s.is_empty() { return; }
 
-    match data[0] % 8 {
+    match input.variant % 8 {
         0 => {
-            let split = char_boundary(s, data[1] as usize);
+            let split = char_boundary(s, input.split as usize);
             let (start_tok, rest) = s.split_at(split);
             let cfg = JsonParserConfig {
                 tool_call_start_tokens: vec![start_tok.into()],
@@ -31,7 +39,7 @@ fuzz_target!(|data: &[u8]| {
             let _ = try_tool_call_parse_basic_json(rest, &cfg, None);
         }
         1 => {
-            let split = char_boundary(s, data[1] as usize);
+            let split = char_boundary(s, input.split as usize);
             let (end_tok, rest) = s.split_at(split);
             let cfg = JsonParserConfig {
                 tool_call_start_tokens: vec!["<tool>".into()],
@@ -42,7 +50,7 @@ fuzz_target!(|data: &[u8]| {
             let _ = try_tool_call_parse_basic_json(rest, &cfg, None);
         }
         2 => {
-            let split = char_boundary(s, data[1] as usize);
+            let split = char_boundary(s, input.split as usize);
             let (tok, rest) = s.split_at(split);
             let cfg = XmlParserConfig {
                 tool_call_start_token: tok.into(),
@@ -52,7 +60,7 @@ fuzz_target!(|data: &[u8]| {
             let _ = try_tool_call_parse_xml(rest, &cfg, None);
         }
         3 => {
-            let split = char_boundary(s, data[1] as usize);
+            let split = char_boundary(s, input.split as usize);
             let (sep, rest) = s.split_at(split);
             let cfg = JsonParserConfig {
                 tool_call_start_tokens: vec!["<｜tool▁calls▁begin｜>".into()],
@@ -64,7 +72,7 @@ fuzz_target!(|data: &[u8]| {
             let _ = parse_tool_calls_deepseek_v3(rest, &cfg, None);
         }
         4 => {
-            let split = char_boundary(s, data[1] as usize);
+            let split = char_boundary(s, input.split as usize);
             let (sep, rest) = s.split_at(split);
             let cfg = JsonParserConfig {
                 tool_call_start_tokens: vec!["<｜tool▁calls▁begin｜>".into()],

@@ -1,19 +1,24 @@
 #![no_main]
+use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use dynamo_kv_router::RadixTree;
 use dynamo_kv_router::protocols::{LocalBlockHash, WorkerWithDpRank};
 use dynamo_kv_router_fuzz::make_store_event;
 
-fuzz_target!(|data: &[u8]| {
-    if data.len() < 3 { return; }
+#[derive(Debug, Arbitrary)]
+struct FuzzInput {
+    prefix_ctl: u8,
+    hash_bytes: Vec<u8>,
+}
 
+fuzz_target!(|input: FuzzInput| {
     let mut tree = RadixTree::new();
     let w0 = WorkerWithDpRank { worker_id: 0, dp_rank: 0 };
 
     // Build unique hash sequence (avoid known RefCell aliasing bug)
     let mut hashes = Vec::new();
     let mut seen = [false; 32];
-    for &b in &data[1..] {
+    for &b in &input.hash_bytes {
         let h = (b % 32) as u64;
         if !seen[h as usize] {
             seen[h as usize] = true;
@@ -36,7 +41,7 @@ fuzz_target!(|data: &[u8]| {
         "Exact score {score} != stored len {}. Hashes: {:?}", hashes.len(), hashes);
 
     // Prefix query — score should be <= prefix length
-    let plen = (data[0] as usize % hashes.len()) + 1;
+    let plen = (input.prefix_ctl as usize % hashes.len()) + 1;
     if plen < hashes.len() {
         let pq: Vec<LocalBlockHash> = hashes[..plen].iter().map(|&h| LocalBlockHash(h)).collect();
         let ps = tree.find_matches(pq, false);
