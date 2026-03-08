@@ -1,11 +1,20 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use dynamo_kv_router::zmq_wire::{parse_mm_hash_from_extra_key, extra_keys_to_block_mm_infos};
+use dynamo_kv_router::zmq_wire::{
+    parse_mm_hash_from_extra_key, extra_keys_to_block_mm_infos,
+    KvEventBatch, RawKvEvent,
+};
 
-/// Fuzz the ZMQ wire format parsing functions.
-/// parse_mm_hash_from_extra_key parses hex strings into u64 hashes.
-/// extra_keys_to_block_mm_infos converts nested string arrays to block info.
 fuzz_target!(|data: &[u8]| {
+    // --- KvEventBatch: full JSON deserialization of batch events ---
+    // Exercises RawKvEventVisitor which handles both map and seq formats,
+    // backward compat with extra fields, BlockHashValue signed/unsigned, etc.
+    let _ = serde_json::from_slice::<KvEventBatch>(data);
+
+    // --- RawKvEvent: single event deserialization ---
+    let _ = serde_json::from_slice::<RawKvEvent>(data);
+
+    // --- Original parse_mm_hash_from_extra_key tests ---
     let Ok(s) = std::str::from_utf8(data) else { return };
 
     // parse_mm_hash_from_extra_key must not panic

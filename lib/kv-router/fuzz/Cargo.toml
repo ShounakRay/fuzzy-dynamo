@@ -69,3 +69,13 @@ doc = false
 name = "fuzz_triple_differential"
 path = "fuzz_targets/fuzz_triple_differential.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_worker_selector"
+path = "fuzz_targets/fuzz_worker_selector.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_concurrent_stress"
+path = "fuzz_targets/fuzz_concurrent_stress.rs"
+doc = false
