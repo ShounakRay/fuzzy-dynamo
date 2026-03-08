@@ -23,8 +23,38 @@ path = ".."
 members = ["."]
 
 [[bin]]
-name = "fuzz_parser_crash_oracle"
-path = "fuzz_targets/fuzz_parser_crash_oracle.rs"
+name = "fuzz_tool_call_parsers"
+path = "fuzz_targets/fuzz_tool_call_parsers.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_named_configs"
+path = "fuzz_targets/fuzz_named_configs.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_detect_start"
+path = "fuzz_targets/fuzz_detect_start.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_end_positions"
+path = "fuzz_targets/fuzz_end_positions.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_deepseek_variants"
+path = "fuzz_targets/fuzz_deepseek_variants.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_reasoning_oneshot"
+path = "fuzz_targets/fuzz_reasoning_oneshot.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_reasoning_streaming"
+path = "fuzz_targets/fuzz_reasoning_streaming.rs"
 doc = false
 
 [[bin]]
