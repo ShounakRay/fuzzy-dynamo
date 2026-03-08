@@ -15,6 +15,7 @@ path = "src/lib.rs"
 libfuzzer-sys = "0.4"
 serde_json = "1"
 arbitrary = { version = "1", features = ["derive"] }
+rustc-hash = "2"
 
 [dependencies.dynamo-kv-router]
 path = ".."
@@ -52,4 +53,9 @@ doc = false
 [[bin]]
 name = "fuzz_zmq_wire"
 path = "fuzz_targets/fuzz_zmq_wire.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_differential_indexers"
+path = "fuzz_targets/fuzz_differential_indexers.rs"
 doc = false

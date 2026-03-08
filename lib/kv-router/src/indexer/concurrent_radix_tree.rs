@@ -36,14 +36,14 @@ use super::{SyncIndexer, WorkerTask};
 use crate::protocols::*;
 
 /// Thread-safe shared reference to a Block.
-type SharedBlock = Arc<RwLock<Block>>;
+pub type SharedBlock = Arc<RwLock<Block>>;
 
 /// Per-worker block-hash map. Inner RwLock allows concurrent reads of different workers.
-type WorkerLookup = FxHashMap<ExternalSequenceBlockHash, SharedBlock>;
+pub type WorkerLookup = FxHashMap<ExternalSequenceBlockHash, SharedBlock>;
 
 /// A block in the concurrent radix tree.
 #[derive(Debug)]
-struct Block {
+pub struct Block {
     /// A map of child blocks, keyed by their local block hash.
     children: FxHashMap<LocalBlockHash, SharedBlock>,
     /// The set of workers that have this block cached.
@@ -285,7 +285,7 @@ impl ConcurrentRadixTree {
     /// ### Arguments
     ///
     /// * `event` - The `RouterEvent` to apply.
-    fn apply_event(
+    pub fn apply_event(
         &self,
         lookup: &mut FxHashMap<WorkerWithDpRank, WorkerLookup>,
         event: RouterEvent,
@@ -477,7 +477,7 @@ impl ConcurrentRadixTree {
     /// Helper function to remove or clear blocks for a worker.
     /// If `keep_worker` is true, the worker remains in lookup with empty blocks.
     /// If `keep_worker` is false, the worker is completely removed from lookup.
-    fn remove_or_clear_worker_blocks(
+    pub fn remove_or_clear_worker_blocks(
         &self,
         lookup: &mut FxHashMap<WorkerWithDpRank, WorkerLookup>,
         worker_id: WorkerId,
