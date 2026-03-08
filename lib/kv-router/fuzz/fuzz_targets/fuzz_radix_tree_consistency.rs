@@ -43,6 +43,8 @@ fuzz_target!(|data: &[u8]| {
         if let Some(&s) = ps.scores.get(&w0) {
             assert!(s as usize <= plen,
                 "Prefix score {s} > prefix len {plen}. Hashes: {:?}", &hashes[..plen]);
+            assert!(s as usize <= score as usize,
+                "Prefix score {s} > exact score {score}");
         }
     }
 

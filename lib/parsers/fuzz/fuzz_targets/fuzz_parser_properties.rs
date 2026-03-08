@@ -127,8 +127,10 @@ fn check_content<E: std::fmt::Debug>(
     let tool_len: usize = calls.iter().map(|c| c.function.name.len() + c.function.arguments.len()).sum();
     assert!(normal_len + tool_len <= input.len() * 3, "{parser}: extracted content far exceeds input");
     if let Some(ref text) = normal_text {
+        let mut input_iter = input.chars();
         for ch in text.chars() {
-            assert!(input.contains(ch), "{parser}: normal_text contains char {ch:?} not in input");
+            assert!(input_iter.any(|c| c == ch),
+                "{parser}: normal_text char {ch:?} out of order or absent from input");
         }
     }
     for call in &calls {

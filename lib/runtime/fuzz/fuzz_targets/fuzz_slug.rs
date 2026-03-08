@@ -21,6 +21,10 @@ fuzz_target!(|data: &[u8]| {
         );
     }
 
+    // slugify must be idempotent
+    let slug_again = Slug::slugify(slug_str);
+    assert_eq!(slug_again.as_ref(), slug_str, "slugify not idempotent");
+
     // slugify_unique must also not panic
     let unique = Slug::slugify_unique(s);
     let unique_str = unique.as_ref();
