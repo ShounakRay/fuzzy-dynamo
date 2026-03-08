@@ -884,6 +884,7 @@ dependencies = [
  "dynamo-runtime",
  "libfuzzer-sys",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

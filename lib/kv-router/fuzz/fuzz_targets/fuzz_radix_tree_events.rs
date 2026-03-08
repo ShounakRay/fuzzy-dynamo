@@ -10,7 +10,7 @@ fuzz_target!(|input: FuzzInput| {
     let ops = if input.ops.len() > 256 { &input.ops[..256] } else { &input.ops };
 
     let mut tree = RadixTree::new();
-    let mut stored: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut stored: HashMap<u64, Vec<(u64, u64)>> = HashMap::new(); // (local_hash, seq_hash)
     let mut event_id: u64 = 0;
 
     for op in ops {
@@ -19,10 +19,11 @@ fuzz_target!(|input: FuzzInput| {
                 let wid = (*worker_id % 4) as u64;
                 let hashes: Vec<u64> = hashes.iter().take(16).map(|&h| (h % 16) as u64).collect();
                 if hashes.is_empty() { continue; }
-                let parent = stored.get(&wid).and_then(|v| v.last().copied());
-                let event = make_store_event(wid, event_id, &hashes, parent);
+                let parent_seq_hash = stored.get(&wid).and_then(|v| v.last().map(|&(_, sh)| sh));
+                let (event, seq_hashes) = make_store_event(wid, event_id, &hashes, parent_seq_hash);
                 let _ = tree.apply_event(event);
-                stored.entry(wid).or_default().extend_from_slice(&hashes);
+                let pairs: Vec<(u64, u64)> = hashes.iter().copied().zip(seq_hashes).collect();
+                stored.entry(wid).or_default().extend(pairs);
                 event_id += 1;
             }
             FuzzOp::Remove { worker_id, index } => {
@@ -30,8 +31,8 @@ fuzz_target!(|input: FuzzInput| {
                 if let Some(worker_hashes) = stored.get_mut(&wid) {
                     if !worker_hashes.is_empty() {
                         let idx = *index as usize % worker_hashes.len();
-                        let hash = worker_hashes.remove(idx);
-                        let event = make_remove_event(wid, event_id, &[hash]);
+                        let (_, seq_hash) = worker_hashes.remove(idx);
+                        let event = make_remove_event(wid, event_id, &[seq_hash]);
                         let _ = tree.apply_event(event);
                         event_id += 1;
                     }

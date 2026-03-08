@@ -28,7 +28,7 @@ fuzz_target!(|input: FuzzInput| {
     if hashes.is_empty() { return; }
 
     // Store for worker 0
-    let event = make_store_event(0, 0, &hashes, None);
+    let (event, _seq_hashes) = make_store_event(0, 0, &hashes, None);
     if tree.apply_event(event).is_err() { return; }
 
     // Exact query — worker 0 should appear with score == len

@@ -64,3 +64,8 @@ doc = false
 name = "fuzz_positional_indexer"
 path = "fuzz_targets/fuzz_positional_indexer.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_triple_differential"
+path = "fuzz_targets/fuzz_triple_differential.rs"
+doc = false

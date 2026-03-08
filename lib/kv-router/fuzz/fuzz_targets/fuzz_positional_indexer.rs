@@ -67,7 +67,7 @@ fuzz_target!(|data: &[u8]| {
 
     let indexer = PositionalIndexer::new(jump_size);
     let mut worker_blocks = FxHashMap::default();
-    let mut stored: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut stored: HashMap<u64, Vec<(u64, u64)>> = HashMap::new(); // (local_hash, seq_hash)
     let mut all_hashes: HashMap<u64, HashSet<u64>> = HashMap::new();
     let mut event_id: u64 = 0;
 
@@ -82,11 +82,12 @@ fuzz_target!(|data: &[u8]| {
                     .filter(|h| !worker_all.contains(h) && seen.insert(*h))
                     .collect();
                 if hashes.is_empty() { continue; }
-                let parent = stored.get(&wid).and_then(|v| v.last().copied());
-                let event = make_store_event(wid, event_id, &hashes, parent);
+                let parent_seq_hash = stored.get(&wid).and_then(|v| v.last().map(|&(_, sh)| sh));
+                let (event, seq_hashes) = make_store_event(wid, event_id, &hashes, parent_seq_hash);
                 let _ = indexer.apply_event(&mut worker_blocks, event);
                 for &h in &hashes { worker_all.insert(h); }
-                stored.entry(wid).or_default().extend_from_slice(&hashes);
+                let pairs: Vec<(u64, u64)> = hashes.iter().copied().zip(seq_hashes).collect();
+                stored.entry(wid).or_default().extend(pairs);
                 event_id += 1;
             }
             PosOp::Remove { worker_id, index } => {
@@ -94,8 +95,8 @@ fuzz_target!(|data: &[u8]| {
                 if let Some(worker_hashes) = stored.get_mut(&wid) {
                     if !worker_hashes.is_empty() {
                         let idx = *index as usize % worker_hashes.len();
-                        let hash = worker_hashes.remove(idx);
-                        let event = make_remove_event(wid, event_id, &[hash]);
+                        let (_, seq_hash) = worker_hashes.remove(idx);
+                        let event = make_remove_event(wid, event_id, &[seq_hash]);
                         let _ = indexer.apply_event(&mut worker_blocks, event);
                         event_id += 1;
                     }

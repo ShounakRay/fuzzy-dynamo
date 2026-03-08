@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 bytes = "1"
 tokio = { version = "1", features = ["rt", "io-util"] }
+tokio-util = { version = "0.7", features = ["codec"] }
 
 [dependencies.dynamo-runtime]
 path = ".."
@@ -32,4 +33,9 @@ doc = false
 [[bin]]
 name = "fuzz_slug"
 path = "fuzz_targets/fuzz_slug.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_network_codecs"
+path = "fuzz_targets/fuzz_network_codecs.rs"
 doc = false

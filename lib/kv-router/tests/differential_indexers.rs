@@ -11,37 +11,60 @@ fn make_store_event(
     worker_id: u64,
     event_id: u64,
     hashes: &[u64],
-    parent: Option<u64>,
-) -> RouterEvent {
-    RouterEvent {
+    parent_seq_hash: Option<u64>,
+) -> (RouterEvent, Vec<u64>) {
+    let mut seq_hashes = Vec::with_capacity(hashes.len());
+    for (i, &h) in hashes.iter().enumerate() {
+        let sh = if i == 0 {
+            match parent_seq_hash {
+                None => h,
+                Some(parent) => {
+                    let mut bytes = [0u8; 16];
+                    bytes[..8].copy_from_slice(&parent.to_le_bytes());
+                    bytes[8..].copy_from_slice(&h.to_le_bytes());
+                    compute_hash(&bytes)
+                }
+            }
+        } else {
+            let mut bytes = [0u8; 16];
+            bytes[..8].copy_from_slice(&seq_hashes[i - 1].to_le_bytes());
+            bytes[8..].copy_from_slice(&h.to_le_bytes());
+            compute_hash(&bytes)
+        };
+        seq_hashes.push(sh);
+    }
+
+    let event = RouterEvent {
         worker_id,
         event: KvCacheEvent {
             event_id,
             data: KvCacheEventData::Stored(KvCacheStoreData {
-                parent_hash: parent.map(|h| ExternalSequenceBlockHash(h * 100)),
+                parent_hash: parent_seq_hash.map(ExternalSequenceBlockHash),
                 blocks: hashes
                     .iter()
-                    .map(|&h| KvCacheStoredBlockData {
+                    .zip(seq_hashes.iter())
+                    .map(|(&h, &sh)| KvCacheStoredBlockData {
                         tokens_hash: LocalBlockHash(h),
-                        block_hash: ExternalSequenceBlockHash(h * 100),
+                        block_hash: ExternalSequenceBlockHash(sh),
                         mm_extra_info: None,
                     })
                     .collect(),
             }),
             dp_rank: 0,
         },
-    }
+    };
+    (event, seq_hashes)
 }
 
-fn make_remove_event(worker_id: u64, event_id: u64, hashes: &[u64]) -> RouterEvent {
+fn make_remove_event(worker_id: u64, event_id: u64, seq_hashes: &[u64]) -> RouterEvent {
     RouterEvent {
         worker_id,
         event: KvCacheEvent {
             event_id,
             data: KvCacheEventData::Removed(KvCacheRemoveData {
-                block_hashes: hashes
+                block_hashes: seq_hashes
                     .iter()
-                    .map(|&h| ExternalSequenceBlockHash(h * 100))
+                    .map(|&sh| ExternalSequenceBlockHash(sh))
                     .collect(),
             }),
             dp_rank: 0,
@@ -83,7 +106,7 @@ fn run_differential(ops: Vec<DiffOp>) {
     let mut radix = RadixTree::new();
     let concurrent = ConcurrentRadixTree::new();
     let mut concurrent_lookup = FxHashMap::default();
-    let mut stored: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut stored: HashMap<u64, Vec<(u64, u64)>> = HashMap::new(); // (local_hash, seq_hash)
     let mut all_hashes: HashMap<u64, HashSet<u64>> = HashMap::new();
     let mut event_id: u64 = 0;
 
@@ -101,14 +124,15 @@ fn run_differential(ops: Vec<DiffOp>) {
                 if deduped.is_empty() {
                     continue;
                 }
-                let parent = stored.get(&wid).and_then(|v| v.last().copied());
-                let event = make_store_event(wid, event_id, &deduped, parent);
+                let parent_seq_hash = stored.get(&wid).and_then(|v| v.last().map(|&(_, sh)| sh));
+                let (event, seq_hashes) = make_store_event(wid, event_id, &deduped, parent_seq_hash);
                 let _ = radix.apply_event(event.clone());
                 let _ = concurrent.apply_event(&mut concurrent_lookup, event);
                 for &h in &deduped {
                     worker_all.insert(h);
                 }
-                stored.entry(wid).or_default().extend_from_slice(&deduped);
+                let pairs: Vec<(u64, u64)> = deduped.iter().copied().zip(seq_hashes).collect();
+                stored.entry(wid).or_default().extend(pairs);
                 event_id += 1;
             }
             DiffOp::Remove { worker_id, index } => {
@@ -116,8 +140,8 @@ fn run_differential(ops: Vec<DiffOp>) {
                 if let Some(worker_hashes) = stored.get_mut(&wid) {
                     if !worker_hashes.is_empty() {
                         let idx = *index as usize % worker_hashes.len();
-                        let hash = worker_hashes.remove(idx);
-                        let event = make_remove_event(wid, event_id, &[hash]);
+                        let (_, seq_hash) = worker_hashes.remove(idx);
+                        let event = make_remove_event(wid, event_id, &[seq_hash]);
                         let _ = radix.apply_event(event.clone());
                         let _ = concurrent.apply_event(&mut concurrent_lookup, event);
                         event_id += 1;
