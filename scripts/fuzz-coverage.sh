@@ -24,7 +24,7 @@ find_llvm_tool() {
     fi
     # Search in rustup toolchain
     local sysroot
-    sysroot="$(rustc +nightly --print sysroot 2>/dev/null)" || true
+    sysroot="$(~/.cargo/bin/rustc +nightly --print sysroot 2>/dev/null)" || true
     if [[ -n "$sysroot" ]]; then
         local found
         found="$(find "$sysroot" -name "$tool" -type f 2>/dev/null | head -1)"
@@ -43,25 +43,30 @@ LLVM_COV="$(find_llvm_tool llvm-cov)"
 echo "Using llvm-profdata: $LLVM_PROFDATA"
 echo "Using llvm-cov:      $LLVM_COV"
 
-# Define crates and their targets
-declare -A CRATE_DIRS=(
-    [parsers]="lib/parsers/fuzz"
-    [kv-router]="lib/kv-router/fuzz"
-    [tokens]="lib/tokens/fuzz"
-    [runtime]="lib/runtime/fuzz"
-)
+# Crate name -> fuzz directory mapping (bash 3.2 compatible)
+CRATE_NAMES="parsers kv-router tokens runtime"
+crate_dir() {
+    case "$1" in
+        parsers)   echo "lib/parsers/fuzz" ;;
+        kv-router) echo "lib/kv-router/fuzz" ;;
+        tokens)    echo "lib/tokens/fuzz" ;;
+        runtime)   echo "lib/runtime/fuzz" ;;
+        *) echo "" ;;
+    esac
+}
 
 get_targets() {
-    local crate_dir="$1"
-    cd "$REPO_ROOT/$crate_dir"
+    local d="$1"
+    cd "$REPO_ROOT/$d"
     ~/.cargo/bin/cargo +nightly fuzz list 2>/dev/null
 }
 
 run_coverage() {
     local crate_name="$1"
     local target="$2"
-    local crate_dir="${CRATE_DIRS[$crate_name]}"
-    local fuzz_dir="$REPO_ROOT/$crate_dir"
+    local cdir
+    cdir="$(crate_dir "$crate_name")"
+    local fuzz_dir="$REPO_ROOT/$cdir"
     local corpus_dir="$fuzz_dir/corpus/$target"
     local out_dir="$COVERAGE_DIR/$crate_name/$target"
 
@@ -98,9 +103,9 @@ run_coverage() {
     mkdir -p "$out_dir"
     "$LLVM_PROFDATA" merge -sparse $profraw_files -o "$out_dir/merged.profdata"
 
-    # Find the fuzz binary
+    # Find the coverage-instrumented binary (built by cargo fuzz coverage)
     local bin_path
-    bin_path="$(find "$fuzz_dir/target" -name "$target" -type f -path '*/release/*' 2>/dev/null | head -1)"
+    bin_path="$(find "$fuzz_dir/target" -name "$target" -type f -path '*/coverage/*/release/*' 2>/dev/null | head -1)"
     if [[ -z "$bin_path" ]]; then
         echo "  WARN: binary not found for $target"
         return
@@ -126,13 +131,18 @@ FILTER_TARGET="${2:-}"
 echo "=== Fuzz Coverage Report Generator ==="
 echo ""
 
-for crate_name in "${!CRATE_DIRS[@]}"; do
+for crate_name in $CRATE_NAMES; do
     if [[ -n "$FILTER_CRATE" ]] && [[ "$crate_name" != "$FILTER_CRATE" ]]; then
         continue
     fi
 
+    cdir="$(crate_dir "$crate_name")"
+    if [[ -z "$cdir" ]]; then
+        continue
+    fi
+
     echo "[$crate_name]"
-    targets="$(get_targets "${CRATE_DIRS[$crate_name]}" 2>/dev/null)" || {
+    targets="$(get_targets "$cdir" 2>/dev/null)" || {
         echo "  SKIP (cannot list targets)"
         continue
     }
