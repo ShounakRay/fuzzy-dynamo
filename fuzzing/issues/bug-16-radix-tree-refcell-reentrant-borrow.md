@@ -1,5 +1,13 @@
 ### [BUG]: RadixTree `apply_event` panics with `RefCell already mutably borrowed` on hash collisions
 
+### What This Bug Is (Plain English)
+
+The KV router uses a radix tree (a tree-shaped data structure) to track which cached blocks of data exist on which workers. Each block gets a hash, and the tree uses these hashes to organize blocks into a hierarchy.
+
+The problem: when two different blocks happen to produce the same hash (a "collision"), the tree reuses the same internal object for both. This creates a situation where a node in the tree is its own child. When the code tries to update this node, it locks it for writing (as the parent) and then tries to read it (as the child) — but it's already locked. This is like trying to open a door you're already holding shut from the other side. The program detects the contradiction and crashes.
+
+A malicious or just unlucky sequence of requests can trigger this, crashing the KV router.
+
 ### Describe the Bug
 
 `RadixTree::apply_event()` in `lib/kv-router/src/radix_tree.rs` panics with `RefCell already mutably borrowed` when processing store events whose block hashes collide.

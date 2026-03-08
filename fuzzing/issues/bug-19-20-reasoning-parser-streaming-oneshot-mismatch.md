@@ -1,5 +1,17 @@
 ### [BUG]: Reasoning parsers produce different output in streaming vs one-shot mode
 
+### What This Bug Is (Plain English)
+
+Some AI models produce "reasoning" (think-out-loud) content alongside their actual response. Dynamo has parsers that separate the reasoning from the real answer. These parsers have two modes: "one-shot" (process the entire response at once) and "streaming" (process it token by token as it arrives).
+
+The problem: these two modes produce different results for the same input. Two specific issues:
+
+1. **Whitespace trimming**: The one-shot mode trims whitespace from its output, but streaming doesn't. So the same input gives `""` in one-shot but `"\n\n"` in streaming.
+
+2. **Lost content**: The streaming mode tries to detect the start of a reasoning section by looking for special tokens like `[THINK]`. If a regular character like `[` arrives on its own, the parser thinks "this might be the beginning of `[THINK]`" and holds onto it, waiting for more. If the next characters don't complete the token, the buffered `[` is silently lost. The one-shot mode doesn't have this problem.
+
+The result: switching between streaming and non-streaming modes can change what the user sees, and in the worst case, actual content gets dropped.
+
 ### Describe the Bug
 
 The reasoning parser's one-shot path (`detect_and_parse_reasoning`) and streaming path (`parse_reasoning_streaming_incremental`) produce different results for the same input. Two distinct issues:

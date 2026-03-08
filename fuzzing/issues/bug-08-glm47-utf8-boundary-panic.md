@@ -1,5 +1,11 @@
 ### [BUG]: GLM-4.7 parser panics on non-ASCII input due to trim offset miscalculation
 
+### What This Bug Is (Plain English)
+
+The GLM-4.7 parser extracts function names from tool calls by trimming whitespace and then slicing the string. But it gets the math wrong when the text contains non-English characters (like `café` or `日本語`). These characters take up more bytes than regular ASCII, and the parser doesn't account for the difference after trimming whitespace. It ends up trying to cut the string at the wrong byte position, which crashes the program.
+
+Any tool call with non-ASCII characters in the function name area — entirely possible with multilingual models — can trigger this crash.
+
 ### Describe the Bug
 
 The GLM-4.7 tool call parser in `lib/parsers/src/tool_calling/xml/glm47_parser.rs` (lines 203-216) extracts the function name by trimming whitespace, then uses the trimmed name's byte length to slice back into the original content string:

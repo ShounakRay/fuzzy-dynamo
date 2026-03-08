@@ -1,5 +1,11 @@
 ### [BUG]: Pythonic and base JSON parsers silently drop text after tool calls
 
+### What This Bug Is (Plain English)
+
+When an AI model responds with both regular text and a tool call — like "Let me check that for you. [calls weather API] Here's what I found:" — the parser is supposed to extract the tool call AND the surrounding text. But two of the parsers (Pythonic and base JSON) only keep the text that comes *before* the tool call. Everything after it is silently thrown away.
+
+So "Let me check. [tool call] Here's the result." becomes just "Let me check." — the model's follow-up explanation vanishes with no error.
+
 ### Describe the Bug
 
 Two tool call parsers only extract text **before** the first tool call, silently dropping any text that appears after:

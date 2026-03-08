@@ -1,5 +1,11 @@
 ### [BUG]: `compute_block_hash_for_seq` panics on `kv_block_size=0`
 
+### What This Bug Is (Plain English)
+
+Dynamo's KV router manages cached data for AI model inference. It splits token sequences into fixed-size blocks and computes a hash for each block. The block size is a parameter — how many tokens go in each chunk.
+
+The problem: if the block size is zero, the code tries to split tokens into chunks of size zero, which is like asking "how many groups of zero can I make?" — it's nonsensical and crashes immediately. Any KV cache request that arrives with a zero block size takes down the router process.
+
 ### Describe the Bug
 
 `compute_block_hash_for_seq()` in `lib/kv-router/src/protocols.rs` calls `tokens.chunks_exact(kv_block_size as usize)` without checking for zero. When `kv_block_size=0`, this panics in the standard library with `chunk_size must be non-zero`.

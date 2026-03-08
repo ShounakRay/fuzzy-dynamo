@@ -1,5 +1,13 @@
 ### [BUG]: Kimi K2 parser caches regex from first config, ignores subsequent configs
 
+### What This Bug Is (Plain English)
+
+The Kimi K2 parser builds a regular expression (a text-matching pattern) based on its configuration — things like what tokens mark the start and end of a tool call. To avoid rebuilding this pattern every time, it caches it globally the first time it's called.
+
+The problem: it caches the pattern from the *first* config it ever sees and then uses that same pattern for all future calls, regardless of what config you pass in. If you later call it with different start/end tokens, it silently ignores your config and parses with the old pattern. The function signature promises "give me a config and I'll use it," but it's lying after the first call.
+
+Currently benign because only one config exists in practice, but it's a landmine for anyone who tries to use a second config.
+
 ### Describe the Bug
 
 The Kimi K2 tool call parser in `lib/parsers/src/tool_calling/xml/kimi_k2_parser.rs` (lines 26-36) builds a regex from the config parameter but stores it in a static `OnceLock`:

@@ -3,31 +3,41 @@ use libfuzzer_sys::fuzz_target;
 use dynamo_parsers::*;
 use dynamo_parsers::tool_calling::config::DsmlParserConfig;
 use dynamo_parsers::tool_calling::json::{
-    JsonParserConfig, JsonParserType, parse_tool_calls_deepseek_v3,
-    try_tool_call_parse_basic_json,
+    JsonParserConfig, JsonParserType, try_tool_call_parse_basic_json,
+    parse_tool_calls_deepseek_v3,
 };
 
+/// Round-trip semantic oracle — embeds known-valid tool calls into
+/// fuzz-controlled surrounding text and verifies extraction correctness.
+///
+/// Bug-specific regression tests live in each parser's #[cfg(test)] module.
 fuzz_target!(|data: &[u8]| {
-    if data.len() < 4 { return; }
-    let Ok(text) = std::str::from_utf8(&data[2..]) else { return };
+    if data.len() < 5 { return; }
+    let Ok(text) = std::str::from_utf8(&data[3..]) else { return };
+    if text.is_empty() { return; }
+
+    let selector = data[0];
 
     let mut split = (data[1] as usize) % (text.len() + 1);
     while split < text.len() && !text.is_char_boundary(split) { split += 1; }
     let (pfx, sfx) = text.split_at(split);
 
-    match data[0] % 5 {
+    match selector % 5 {
+        // --- Round-trip: XML ---
         0 => {
             let input = format!(
                 r#"{pfx}<tool_call>{{"name":"get_weather","arguments":{{"location":"NYC"}}}}</tool_call>{sfx}"#
             );
             let Ok((calls, _)) = try_tool_call_parse_xml(&input, &XmlParserConfig::default(), None) else { return };
-            verify(&calls, "get_weather", "location", "NYC", "xml");
+            verify_roundtrip(&calls, "get_weather", "location", "NYC", "xml");
         }
+        // --- Round-trip: Pythonic ---
         1 => {
             let input = format!(r#"{pfx}get_weather(location="NYC"){sfx}"#);
             let Ok((calls, _)) = try_tool_call_parse_pythonic(&input, None) else { return };
-            verify(&calls, "get_weather", "location", "NYC", "pythonic");
+            verify_roundtrip(&calls, "get_weather", "location", "NYC", "pythonic");
         }
+        // --- Round-trip: DSML ---
         2 => {
             let input = format!(
                 "{pfx}<｜DSML｜function_calls><｜DSML｜invoke name=\"search\">\
@@ -35,8 +45,9 @@ fuzz_target!(|data: &[u8]| {
                  </｜DSML｜parameter></｜DSML｜invoke></｜DSML｜function_calls>{sfx}"
             );
             let Ok((calls, _)) = try_tool_call_parse_dsml(&input, &DsmlParserConfig::default()) else { return };
-            verify(&calls, "search", "query", "hello", "dsml");
+            verify_roundtrip(&calls, "search", "query", "hello", "dsml");
         }
+        // --- Round-trip: Basic JSON ---
         3 => {
             let cfg = JsonParserConfig {
                 tool_call_start_tokens: vec!["<tool>".into()],
@@ -48,8 +59,9 @@ fuzz_target!(|data: &[u8]| {
                 r#"{pfx}<tool>{{"name":"search","arguments":{{"q":"test"}}}}</tool>{sfx}"#
             );
             let Ok((calls, _)) = try_tool_call_parse_basic_json(&input, &cfg, None) else { return };
-            verify(&calls, "search", "q", "test", "json");
+            verify_roundtrip(&calls, "search", "q", "test", "json");
         }
+        // --- Round-trip: DeepSeek V3 ---
         _ => {
             let cfg = JsonParserConfig {
                 tool_call_start_tokens: vec!["<｜tool▁calls▁begin｜>".into()],
@@ -63,12 +75,12 @@ fuzz_target!(|data: &[u8]| {
                        <｜tool▁call▁end｜><｜tool▁calls▁end｜>";
             let input = format!("{pfx}{tc}{sfx}");
             let Ok((calls, _)) = parse_tool_calls_deepseek_v3(&input, &cfg, None) else { return };
-            verify(&calls, "calc", "x", "42", "deepseek");
+            verify_roundtrip(&calls, "calc", "x", "42", "deepseek");
         }
     }
 });
 
-fn verify(calls: &[ToolCallResponse], func: &str, key: &str, val: &str, parser: &str) {
+fn verify_roundtrip(calls: &[ToolCallResponse], func: &str, key: &str, val: &str, parser: &str) {
     if calls.is_empty() { return; }
     assert_eq!(calls[0].function.name, func, "{parser}: func name wrong");
     let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments)

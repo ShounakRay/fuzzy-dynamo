@@ -1,0 +1,100 @@
+# Parser fuzzing dictionary — domain-specific tokens for all tool call and reasoning formats
+
+# XML tool call format (Hermes, NemotronDeci, etc.)
+"<tool_call>"
+"</tool_call>"
+"<function="
+"</function>"
+"<arguments>"
+"</arguments>"
+
+# Pythonic format
+"get_weather("
+"location="
+")\n"
+"search("
+
+# DSML format (fullwidth special chars)
+"\xef\xbd\x9cDSML\xef\xbd\x9c"
+"function_calls"
+"invoke name="
+"parameter name="
+"string=\"true\""
+"string=\"false\""
+"string=\"True\""
+"string=\"False\""
+
+# DeepSeek V3/V3.1 format (fullwidth special chars)
+"\xe2\x96\x81"
+"tool\xe2\x96\x81calls\xe2\x96\x81begin"
+"tool\xe2\x96\x81call\xe2\x96\x81begin"
+"tool\xe2\x96\x81calls\xe2\x96\x81end"
+"tool\xe2\x96\x81call\xe2\x96\x81end"
+"tool\xe2\x96\x81sep"
+"```json"
+"```"
+
+# GLM-4.7 format
+"<|observation|>"
+"<|system|>"
+"<|user|>"
+"<|assistant|>"
+
+# Kimi K2 format
+"<|tool_call|>"
+"functions."
+
+# Harmony format
+"<|reserved_4|>"
+"<|reserved_5|>"
+"<|reserved_6|>"
+
+# Reasoning tokens
+"<think>"
+"</think>"
+"[THINK]"
+"[/THINK]"
+"<|begin_of_thought|>"
+"<|end_of_thought|>"
+"<|startofthought|>"
+"<|endofthought|>"
+
+# JSON structure tokens
+"{"
+"}"
+"["
+"]"
+"\"name\":"
+"\"arguments\":"
+"\"function\":"
+"\"type\":"
+
+# Python literals that trigger try_literal_eval
+"True"
+"False"
+"None"
+"true"
+"false"
+"null"
+
+# Strings that trigger corruption in try_literal_eval
+"TrueNorth"
+"Falsehood"
+"NonEmpty"
+
+# XML entities
+"&lt;"
+"&gt;"
+"&amp;"
+"&quot;"
+"&apos;"
+"&#x27;"
+"&#39;"
+
+# Edge cases
+"\""
+"'"
+"\n"
+"\r\n"
+""
+" "

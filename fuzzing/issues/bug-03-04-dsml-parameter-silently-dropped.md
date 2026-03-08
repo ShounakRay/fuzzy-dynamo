@@ -1,5 +1,13 @@
 ### [BUG]: DSML parser silently drops parameters with capitalized `string="True"` or missing `string` attribute
 
+### What This Bug Is (Plain English)
+
+When an AI model makes a tool call (like "search the web for X"), its output gets parsed by dynamo to extract the function name and arguments. The DSML parser handles one specific format for this. Each argument has a tag that says whether the value is a string or not — something like `string="true"`.
+
+The problem: the parser is too picky about the exact casing of that tag. If the model writes `string="True"` (capital T, which Python-trained models love to do) instead of `string="true"`, the parser doesn't recognize it and **silently throws away the entire argument**. No error, no warning — the data just vanishes. Same thing if the model skips the tag entirely.
+
+This means a perfectly valid tool call like `search(query="weather in NYC")` could arrive at the tool with zero arguments, and nobody would know why.
+
 ### Describe the Bug
 
 The DSML tool call parser in `lib/parsers/src/tool_calling/dsml/parser.rs` uses a regex (lines 173-176) that is too strict about the `string` attribute on `<parameter>` tags:

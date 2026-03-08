@@ -39,11 +39,6 @@ path = "fuzz_targets/fuzz_kv_protocol_json.rs"
 doc = false
 
 [[bin]]
-name = "fuzz_positional_indexer"
-path = "fuzz_targets/fuzz_positional_indexer.rs"
-doc = false
-
-[[bin]]
 name = "fuzz_request_extra_info"
 path = "fuzz_targets/fuzz_request_extra_info.rs"
 doc = false
@@ -51,4 +46,9 @@ doc = false
 [[bin]]
 name = "fuzz_radix_tree_consistency"
 path = "fuzz_targets/fuzz_radix_tree_consistency.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_zmq_wire"
+path = "fuzz_targets/fuzz_zmq_wire.rs"
 doc = false

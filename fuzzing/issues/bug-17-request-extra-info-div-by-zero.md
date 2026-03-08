@@ -1,5 +1,11 @@
 ### [BUG]: `RequestExtraInfo::to_block_level` panics with division by zero when `block_size=0`
 
+### What This Bug Is (Plain English)
+
+The KV router needs to figure out which cached blocks correspond to a request's tokens. It does this by dividing token positions by the block size to find which block they fall into. But if the block size is zero, dividing by zero crashes the program instantly.
+
+This is the same class of bug as Bug 15 (zero block size in `compute_block_hash_for_seq`) — the KV router subsystem doesn't validate the block size parameter before doing math with it. Any request with a zero block size crashes the router.
+
 ### Describe the Bug
 
 `RequestExtraInfo::to_block_level()` in `lib/kv-router/src/protocols.rs` divides by `block_size` in three places without checking for zero:

@@ -1,0 +1,2 @@
+Before text. get_weather(location="NYC")
+After text should be preserved.

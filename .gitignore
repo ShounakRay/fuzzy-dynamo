@@ -141,6 +141,28 @@ package-lock.json
 
 # Fuzzing
 fuzzing/.fuzz-env/
+fuzzing/bench-results/
+fuzzing/ablation-results/
+fuzzing/coverage-report/
 **/fuzz/target/
 **/fuzz/corpus/
 **/fuzz/artifacts/
+
+# LaTeX
+fuzzing/*.tex
+fuzzing/chapters/
+fuzzing/*.aux
+fuzzing/*.fdb_latexmk
+fuzzing/*.fls
+fuzzing/*.log
+fuzzing/*.out
+fuzzing/*.toc
+fuzzing/*.pdf
+fuzzing/*.synctex.gz
+fuzzing/*.bbl
+fuzzing/*.blg
+fuzzing/*.lof
+fuzzing/*.lot
+fuzzing/*.idx
+fuzzing/*.ind
+fuzzing/*.ilg

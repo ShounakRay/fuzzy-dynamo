@@ -1,5 +1,11 @@
 ### [BUG]: `try_literal_eval` corrupts string values containing `True`, `False`, or `None` as substrings
 
+### What This Bug Is (Plain English)
+
+Some AI models output Python-style values like `True`, `False`, and `None` instead of JSON's `true`, `false`, and `null`. The parser has a converter that does a find-and-replace to fix this. But the replacement is too aggressive — it replaces those words *everywhere*, including inside text that just happens to contain them.
+
+So if a tool call argument is `"Search for TrueNorth Navigation company"`, the parser corrupts it to `"Search for trueNorth Navigation company"`. The word `"None"` inside `"NonEmpty"` becomes `"nullEmpty"`. User data gets silently mangled.
+
 ### Describe the Bug
 
 The `try_literal_eval` function in `lib/parsers/src/tool_calling/xml/parser.rs` (lines 491-495) performs global string replacements to convert Python literals to JSON:

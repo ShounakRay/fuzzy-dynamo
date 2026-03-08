@@ -1,0 +1,1 @@
+<｜DSML｜function_calls><｜DSML｜invoke name="count"><｜DSML｜parameter name="n">42</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜function_calls>

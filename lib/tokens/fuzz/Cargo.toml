@@ -18,13 +18,8 @@ path = ".."
 members = ["."]
 
 [[bin]]
-name = "fuzz_positional_sequence_hash"
-path = "fuzz_targets/fuzz_positional_sequence_hash.rs"
-doc = false
-
-[[bin]]
-name = "fuzz_positional_lineage_hash"
-path = "fuzz_targets/fuzz_positional_lineage_hash.rs"
+name = "fuzz_positional_hash"
+path = "fuzz_targets/fuzz_positional_hash.rs"
 doc = false
 
 [[bin]]

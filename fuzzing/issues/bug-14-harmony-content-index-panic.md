@@ -1,5 +1,11 @@
 ### [BUG]: Harmony parser panics on empty `content` vector in analysis channel
 
+### What This Bug Is (Plain English)
+
+The Harmony parser processes messages that come through different "channels" (like analysis and commentary). When it gets an analysis channel message, it grabs the first item from the message's content list using `content[0]`. But it never checks if the list is empty first.
+
+If an analysis message arrives with no content (an empty list), the code tries to access the first element of nothing, and crashes. Ironically, the code for the commentary channel right above it handles this correctly by checking with `.first()` — the analysis branch just forgot to do the same thing.
+
 ### Describe the Bug
 
 The harmony tool call parser in `lib/parsers/src/tool_calling/harmony/harmony_parser.rs` (line 123) uses direct indexing `message.content[0]` without checking if the content vector is empty:

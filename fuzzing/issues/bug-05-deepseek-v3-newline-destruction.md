@@ -1,5 +1,11 @@
 ### [BUG]: DeepSeek V3 parser destroys newlines in tool call arguments during JSON normalization
 
+### What This Bug Is (Plain English)
+
+When an AI model returns a tool call with a code snippet as an argument (like "run this Python code"), the code naturally contains newlines. The DeepSeek V3 parser has a fallback path that tries to fix malformed JSON by joining all the lines together with spaces. This destroys every newline in the process.
+
+So if the model says "run this code: `def hello():\n    print('hi')`", the parser turns it into `def hello(): print('hi')` — which is broken Python. The code argument gets mangled, and the tool receives something that doesn't work.
+
 ### Describe the Bug
 
 The DeepSeek V3 parser in `lib/parsers/src/tool_calling/json/deepseek_v3_parser.rs` has a JSON normalization fallback (lines 115-119) that joins all lines with spaces, destroying intentional newlines in string values:

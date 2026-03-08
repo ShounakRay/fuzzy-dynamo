@@ -1,5 +1,11 @@
 ### [BUG]: `strip_quotes` panics on single-character quote input
 
+### What This Bug Is (Plain English)
+
+There's a helper function that strips matching quotes from strings — turning `"hello"` into `hello`. It checks if the string starts and ends with a quote, then slices off the first and last characters.
+
+The problem: if the string is *just* a single quote character (`"`), it both starts and ends with a quote (it's the same character). The function tries to slice from position 1 to position 0, which is impossible, and crashes. This can happen when a model outputs a malformed tool call argument that's just a lone quote character.
+
 ### Describe the Bug
 
 The `strip_quotes` function in `lib/parsers/src/tool_calling/xml/parser.rs` (lines 19-28) panics when the input is a single quote character (`"` or `'`):
