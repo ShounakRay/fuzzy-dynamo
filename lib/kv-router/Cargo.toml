@@ -57,8 +57,10 @@ tracing-subscriber = { workspace = true, optional = true }
 
 [dev-dependencies]
 dynamo-bench = { path = "../bench" }
+proptest = "1"
 rstest = "0.18.2"
 rstest_reuse = "0.7.0"
+rustc-hash = "2.1.1"
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
 dynamo-mocker = { workspace = true }
