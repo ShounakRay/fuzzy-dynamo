@@ -72,9 +72,10 @@ fuzz_target!(|data: &[u8]| {
             DiffOp::Store { worker_id, h0, h1, h2 } => {
                 let wid = (*worker_id % 2) as u64;
                 let worker_all = all_hashes.entry(wid).or_default();
+                let mut seen = HashSet::new();
                 let hashes: Vec<u64> = [h0, h1, h2].iter()
                     .map(|&h| (*h % 8) as u64)
-                    .filter(|h| !worker_all.contains(h))
+                    .filter(|h| !worker_all.contains(h) && seen.insert(*h))
                     .collect();
                 if hashes.is_empty() { continue; }
                 let parent = stored.get(&wid).and_then(|v| v.last().copied());
