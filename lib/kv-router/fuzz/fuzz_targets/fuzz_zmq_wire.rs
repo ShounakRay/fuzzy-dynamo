@@ -1,18 +1,34 @@
 #![no_main]
+use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
+
 use libfuzzer_sys::fuzz_target;
 use dynamo_kv_router::zmq_wire::{
     parse_mm_hash_from_extra_key, extra_keys_to_block_mm_infos,
-    KvEventBatch, RawKvEvent,
+    convert_event, KvEventBatch, RawKvEvent,
 };
 
 fuzz_target!(|data: &[u8]| {
-    // --- KvEventBatch: full JSON deserialization of batch events ---
-    // Exercises RawKvEventVisitor which handles both map and seq formats,
-    // backward compat with extra fields, BlockHashValue signed/unsigned, etc.
-    let _ = serde_json::from_slice::<KvEventBatch>(data);
+    // --- KvEventBatch: full JSON deserialization + convert_event pipeline ---
+    if let Ok(batch) = serde_json::from_slice::<KvEventBatch>(data) {
+        let warning_count = Arc::new(AtomicU32::new(0));
+        let dp_rank = batch.data_parallel_rank.unwrap_or(0) as u32;
+        for (i, event) in batch.events.into_iter().enumerate() {
+            // This exercises the full ZMQ → router pipeline including
+            // create_stored_blocks which can OOB on mismatched sizes
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                convert_event(event, i as u64, 16, dp_rank, &warning_count)
+            }));
+        }
+    }
 
-    // --- RawKvEvent: single event deserialization ---
-    let _ = serde_json::from_slice::<RawKvEvent>(data);
+    // --- RawKvEvent: single event deserialization + convert ---
+    if let Ok(event) = serde_json::from_slice::<RawKvEvent>(data) {
+        let warning_count = Arc::new(AtomicU32::new(0));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            convert_event(event, 0, 16, 0, &warning_count)
+        }));
+    }
 
     // --- Original parse_mm_hash_from_extra_key tests ---
     let Ok(s) = std::str::from_utf8(data) else { return };
