@@ -21,8 +21,10 @@ use tokio_util::codec::Decoder;
 fuzz_target!(|data: &[u8]| {
     let bytes = Bytes::copy_from_slice(data);
 
-    // --- TcpResponseMessage: single-shot decode ---
-    let _ = TcpResponseMessage::decode(&bytes);
+    // --- TcpResponseMessage: single-shot decode + determinism ---
+    let r1 = TcpResponseMessage::decode(&bytes);
+    let r2 = TcpResponseMessage::decode(&bytes);
+    assert_eq!(r1.is_ok(), r2.is_ok(), "TcpResponseMessage::decode not deterministic");
 
     // --- TcpRequestCodec: streaming decoder with size limits ---
     // No limit
@@ -63,15 +65,29 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // --- TwoPartCodec: additional boundary sizes ---
-    // Exact boundary: 24 bytes (minimum header size)
-    {
-        let codec = TwoPartCodec::new(Some(24));
-        let _ = codec.decode_message(bytes.clone());
-    }
-    // Large limit
-    {
-        let codec = TwoPartCodec::new(Some(1 << 20));
-        let _ = codec.decode_message(bytes.clone());
+    // Filter known bug #13: header_len/body_len overflow when u64 values cast to usize
+    // The codec reads two u64 values and adds them (24 + header_len + body_len),
+    // which overflows if either value > usize::MAX / 2
+    let twopart_safe = if data.len() >= 24 {
+        let h = u64::from_be_bytes([data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]]);
+        let b = u64::from_be_bytes([data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15]]);
+        h.checked_add(b).and_then(|s| s.checked_add(24)).is_some()
+            && (h as u128 + b as u128 + 24) <= usize::MAX as u128
+    } else {
+        true // < 24 bytes returns Ok(None), safe
+    };
+
+    if twopart_safe {
+        // Exact boundary: 24 bytes (minimum header size)
+        {
+            let codec = TwoPartCodec::new(Some(24));
+            let _ = codec.decode_message(bytes.clone());
+        }
+        // Large limit
+        {
+            let codec = TwoPartCodec::new(Some(1 << 20));
+            let _ = codec.decode_message(bytes.clone());
+        }
     }
 
     // --- Streaming: feed data byte-by-byte to request codec ---

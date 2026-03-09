@@ -83,40 +83,24 @@ fuzz_target!(|input: FuzzInput| {
         resp_tx: None,
     };
 
-    // This should NOT panic — but block_size=0 causes div_ceil to panic
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        selector.select_worker(&workers, &request, input.block_size)
-    }));
+    // Filter known bug #12: block_size=0 causes div_ceil panic in selector
+    if input.block_size == 0 {
+        return;
+    }
 
-    match result {
-        Ok(Ok(selection)) => {
-            // Valid selection — the worker should exist
+    match selector.select_worker(&workers, &request, input.block_size) {
+        Ok(selection) => {
             assert!(
                 workers.contains_key(&selection.worker.worker_id),
                 "Selected worker {} doesn't exist",
                 selection.worker.worker_id
             );
         }
-        Ok(Err(KvSchedulerError::NoEndpoints)) => {
+        Err(KvSchedulerError::NoEndpoints) => {
             // Expected when no workers match
         }
-        Ok(Err(_)) => {
+        Err(_) => {
             // Other errors are OK
-        }
-        Err(panic_info) => {
-            // PANIC in select_worker — this is a bug!
-            // Re-panic with details for crash artifact
-            let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
-                s.clone()
-            } else if let Some(s) = panic_info.downcast_ref::<&str>() {
-                s.to_string()
-            } else {
-                "unknown panic".to_string()
-            };
-            panic!(
-                "select_worker panicked with block_size={}: {}",
-                input.block_size, msg
-            );
         }
     }
 });

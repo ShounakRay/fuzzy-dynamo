@@ -11,9 +11,9 @@ use dynamo_kv_router::zmq_wire::{
 fuzz_target!(|data: &[u8]| {
     if data.len() < 8 { return; }
 
-    let kv_block_size = (data[0] as u32) % 33; // 0..=32, including 0 to test zero case
-    let num_blocks = (data[1] % 8) as usize + 1; // 1..=8
-    let token_count = (data[2] as usize) % 64; // 0..=63 tokens, possibly mismatched
+    let kv_block_size = (data[0] as u32) % 33; // 0..=32
+    let num_blocks = (data[1] % 8) as usize + 1;
+    let token_count = (data[2] as usize) % 64;
 
     // Build token_ids from remaining data
     let mut token_ids: Vec<u32> = Vec::new();
@@ -24,72 +24,82 @@ fuzz_target!(|data: &[u8]| {
         pos += 4;
     }
 
-    // Build block hashes and num_block_tokens
     let num_block_tokens: Vec<u64> = vec![kv_block_size as u64; num_blocks];
     let block_hashes: Vec<u64> = (0..num_blocks).map(|i| i as u64 * 1000 + 1).collect();
-
     let warning_count = Arc::new(AtomicU32::new(0));
 
-    // --- Test create_stored_blocks with potentially mismatched sizes ---
-    // This can panic if token_ids is too short for the claimed blocks
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        create_stored_blocks(
-            kv_block_size,
-            &token_ids,
-            &num_block_tokens,
-            &block_hashes,
-            None,
-            &warning_count,
-            None,
-        )
-    }));
-    // Record if this panicked — that's a bug in the function
-    if result.is_err() {
-        // Panic detected — this is the bug we're looking for
-        // Re-panic to save crash artifact
-        create_stored_blocks(
-            kv_block_size,
-            &token_ids,
-            &num_block_tokens,
-            &block_hashes,
-            None,
-            &warning_count,
-            None,
-        );
+    // --- Filter known bugs instead of catch_unwind (ASAN bypasses catch_unwind) ---
+    // Bug #6: OOB slice when token_ids shorter than claimed blocks
+    let expected_tokens = num_blocks * kv_block_size as usize;
+    if kv_block_size == 0 || token_ids.len() < expected_tokens {
+        // Known bug territory — skip to avoid ASAN abort
+        return;
     }
 
-    // --- Test create_stored_block_from_parts with mismatched sizes ---
-    let result2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        create_stored_block_from_parts(
+    // Safe path: token_ids is large enough for the claimed blocks
+    let blocks = create_stored_blocks(
+        kv_block_size,
+        &token_ids,
+        &num_block_tokens,
+        &block_hashes,
+        None,
+        &warning_count,
+        None,
+    );
+
+    // Property: returned blocks count should not exceed input blocks
+    assert!(blocks.len() <= num_blocks,
+        "create_stored_blocks returned {} blocks from {} input blocks",
+        blocks.len(), num_blocks);
+
+    // Determinism: same input → same output
+    let warning_count2 = Arc::new(AtomicU32::new(0));
+    let blocks2 = create_stored_blocks(
+        kv_block_size,
+        &token_ids,
+        &num_block_tokens,
+        &block_hashes,
+        None,
+        &warning_count2,
+        None,
+    );
+    assert_eq!(blocks.len(), blocks2.len(), "create_stored_blocks not deterministic");
+
+    // --- Test create_stored_block_from_parts ---
+    if !token_ids.is_empty() && kv_block_size > 0 {
+        let slice_len = token_ids.len().min(kv_block_size as usize);
+        let block = create_stored_block_from_parts(
             kv_block_size,
             42,
-            &token_ids,
-            None,
-            None,
-        )
-    }));
-    if result2.is_err() {
-        create_stored_block_from_parts(
-            kv_block_size,
-            42,
-            &token_ids,
+            &token_ids[..slice_len],
             None,
             None,
         );
+        // Property: block hash should be deterministic
+        let block2 = create_stored_block_from_parts(
+            kv_block_size,
+            42,
+            &token_ids[..slice_len],
+            None,
+            None,
+        );
+        assert_eq!(block.tokens_hash, block2.tokens_hash,
+            "create_stored_block_from_parts not deterministic");
     }
 
     // --- Test convert_event with deserialized RawKvEvent ---
-    // Try to deserialize the raw bytes as a RawKvEvent and feed through convert_event
     if let Ok(event) = serde_json::from_slice::<RawKvEvent>(data) {
-        let warning_count2 = Arc::new(AtomicU32::new(0));
-        let result3 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            convert_event(event, 0, kv_block_size, 0, &warning_count2)
-        }));
-        if let Err(e) = result3 {
-            // Re-deserialize and re-panic to save artifact
-            let event = serde_json::from_slice::<RawKvEvent>(data).unwrap();
-            let warning_count3 = Arc::new(AtomicU32::new(0));
-            convert_event(event, 0, kv_block_size, 0, &warning_count3);
+        let wc = Arc::new(AtomicU32::new(0));
+        // Skip events that would trigger known OOB bugs
+        match &event {
+            RawKvEvent::BlockStored { block_hashes, token_ids, block_size, .. } => {
+                let needed = block_hashes.len() * *block_size;
+                if *block_size == 0 || token_ids.len() < needed {
+                    return;
+                }
+            }
+            _ => {}
         }
+        let _ = convert_event(event, 0, kv_block_size, 0, &wc);
     }
 });

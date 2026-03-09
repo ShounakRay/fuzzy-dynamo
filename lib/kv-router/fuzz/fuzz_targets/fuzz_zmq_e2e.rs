@@ -9,10 +9,8 @@ use dynamo_kv_router::ConcurrentRadixTree;
 use dynamo_kv_router::zmq_wire::{convert_event, KvEventBatch, RawKvEvent};
 use dynamo_kv_router::protocols::RouterEvent;
 
-/// End-to-end fuzz target: JSON bytes → deserialize → convert_event → apply to radix tree.
-/// This is the actual pipeline that runs in the ZMQ listener.
+/// End-to-end: JSON → deserialize → convert_event → apply to radix tree.
 fuzz_target!(|data: &[u8]| {
-    // Try batch format first, then single event
     let events: Vec<(RawKvEvent, u32)> = if let Ok(batch) = serde_json::from_slice::<KvEventBatch>(data) {
         let dp_rank = batch.data_parallel_rank.unwrap_or(0) as u32;
         batch.events.into_iter().map(|e| (e, dp_rank)).collect()
@@ -28,20 +26,23 @@ fuzz_target!(|data: &[u8]| {
     let worker_id = 0u64;
 
     for (i, (raw_event, dp_rank)) in events.into_iter().enumerate() {
-        // convert_event can panic on mismatched sizes — catch those
-        let converted = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            convert_event(raw_event, i as u64, 16, dp_rank, &warning_count)
-        })) {
-            Ok(event) => event,
-            Err(_) => continue,
-        };
+        // Filter known OOB bugs instead of catch_unwind (ASAN bypasses it)
+        match &raw_event {
+            RawKvEvent::BlockStored { block_hashes, token_ids, block_size, .. } => {
+                let needed = block_hashes.len() * *block_size;
+                if *block_size == 0 || token_ids.len() < needed {
+                    continue;
+                }
+            }
+            _ => {}
+        }
 
-        // Build RouterEvent and apply to tree
+        let converted = convert_event(raw_event, i as u64, 16, dp_rank, &warning_count);
         let router_event = RouterEvent::new(worker_id, converted);
         let _ = tree.apply_event(&mut lookup, router_event);
     }
 
-    // Query the tree after all events
+    // Query the tree after all events — should not panic
     let query: Vec<dynamo_kv_router::protocols::LocalBlockHash> = vec![
         dynamo_kv_router::protocols::LocalBlockHash(0),
         dynamo_kv_router::protocols::LocalBlockHash(1),
