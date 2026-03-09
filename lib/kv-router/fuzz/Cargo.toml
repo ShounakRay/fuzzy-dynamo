@@ -84,3 +84,8 @@ doc = false
 name = "fuzz_stored_blocks"
 path = "fuzz_targets/fuzz_stored_blocks.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_zmq_e2e"
+path = "fuzz_targets/fuzz_zmq_e2e.rs"
+doc = false
