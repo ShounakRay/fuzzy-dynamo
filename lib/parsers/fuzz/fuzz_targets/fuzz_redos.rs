@@ -1,0 +1,17 @@
+#![no_main]
+use libfuzzer_sys::fuzz_target;
+use dynamo_parsers::*;
+use dynamo_parsers::tool_calling::config::Glm47ParserConfig;
+use dynamo_parsers::tool_calling::xml::try_tool_call_parse_glm47;
+
+fuzz_target!(|data: &[u8]| {
+    let Ok(s) = std::str::from_utf8(data) else { return };
+
+    let _ = try_tool_call_parse_pythonic(s, None);
+    let _ = try_tool_call_parse_xml(s, &XmlParserConfig::default(), None);
+    let _ = try_tool_call_parse_glm47(s, &Glm47ParserConfig::default(), None);
+    let _ = detect_tool_call_start(s, Some("pythonic"));
+    let _ = detect_tool_call_start(s, Some("qwen3_coder"));
+    let _ = detect_tool_call_start(s, Some("glm47"));
+    let _ = detect_tool_call_start(s, Some("kimi_k2"));
+});

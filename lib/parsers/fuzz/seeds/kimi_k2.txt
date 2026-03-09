@@ -1,0 +1,4 @@
+<|tool_call|>
+functions.get_weather:0
+{"location": "San Francisco"}
+<|tool_call|>

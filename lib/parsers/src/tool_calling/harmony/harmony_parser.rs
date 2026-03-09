@@ -284,6 +284,31 @@ mod tests {
         assert_eq!(args["location"], "San Francisco, CA");
         assert_eq!(args["unit"], "celsius");
     }
+    #[tokio::test]
+    async fn test_analysis_channel_empty_content_no_panic() {
+        // LATENT BUG: Line 123 uses message.content[0] which panics if the
+        // analysis channel message has an empty content vector. The commentary
+        // branch (line 97) correctly uses .first() but the analysis branch
+        // does not. These inputs don't currently trigger the panic because the
+        // harmony tokenizer always produces non-empty content, but the unsafe
+        // indexing is a latent risk if the tokenizer behavior changes.
+        let text = "<|channel|>analysis<|end|>";
+        let result = parse_tool_calls_harmony_complete(text, &Default::default(), None).await;
+        assert!(
+            result.is_ok(),
+            "Analysis channel with empty content should not panic"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_analysis_channel_empty_message_no_panic() {
+        let text = "<|channel|>analysis<|message|>";
+        let result = parse_tool_calls_harmony_complete(text, &Default::default(), None).await;
+        assert!(
+            result.is_ok(),
+            "Analysis channel with empty message should not panic"
+        );
+    }
 }
 
 #[cfg(test)]

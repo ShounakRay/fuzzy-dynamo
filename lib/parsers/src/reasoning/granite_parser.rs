@@ -287,6 +287,55 @@ mod tests {
     }
 
     #[test]
+    fn test_streaming_reasoning_chunk_starting_with_here() {
+        // BUG: If a reasoning chunk happens to be a prefix of an end token
+        // (e.g., "Here" is a prefix of "Here's my response:"), the chunk is
+        // silently buffered instead of emitted as reasoning text.
+        // The content is delayed and only emitted when the next chunk breaks
+        // the prefix match — but if it's the last chunk, content is lost.
+        let mut parser = GraniteReasoningParser::new();
+
+        // Start reasoning
+        let r1 = parser.parse_reasoning_streaming_incremental(
+            "Here's my thought process: Thinking about it. ",
+            &[],
+        );
+        assert_eq!(r1.reasoning_text, " Thinking about it. ");
+
+        // Now a chunk that is a prefix of the end token
+        let r2 = parser.parse_reasoning_streaming_incremental("Here", &[]);
+        // BUG: This returns empty because "Here" is a prefix of "Here's my response:"
+        // but this is reasoning content, not the start of an end token
+        assert_eq!(
+            r2.reasoning_text, "Here",
+            "Reasoning chunk 'Here' is incorrectly buffered because it's a prefix of the end token"
+        );
+    }
+
+    #[test]
+    fn test_streaming_one_shot_equivalence_with_here_in_reasoning() {
+        // Differential test: one-shot vs streaming should produce same output
+        let text = "Here's my thought process: Here is an idea. Here's my response: Done.";
+
+        // One-shot
+        let mut oneshot = GraniteReasoningParser::new();
+        let oneshot_result = oneshot.detect_and_parse_reasoning(text, &[]);
+
+        // Streaming (whole input)
+        let mut streaming = GraniteReasoningParser::new();
+        let streaming_result = streaming.parse_reasoning_streaming_incremental(text, &[]);
+
+        assert_eq!(
+            oneshot_result.reasoning_text, streaming_result.reasoning_text,
+            "Reasoning text mismatch between one-shot and streaming"
+        );
+        assert_eq!(
+            oneshot_result.normal_text, streaming_result.normal_text,
+            "Normal text mismatch between one-shot and streaming"
+        );
+    }
+
+    #[test]
     fn test_case_sensitive_tokens() {
         let mut parser = GraniteReasoningParser::new();
         let text = "here's my thought process: lowercase. here's my response: answer.";

@@ -990,4 +990,208 @@ mod tests {
             "Should not contain Response Format section when not provided"
         );
     }
+
+    // Regression tests for edge cases
+
+    #[test]
+    fn test_missing_role_field() {
+        // Messages without a "role" field should return an error, not panic
+        let messages = json!([
+            {"content": "no role here"}
+        ]);
+
+        let result =
+            encode_messages(messages.as_array().unwrap(), ThinkingMode::Thinking, true);
+
+        assert!(result.is_err(), "Missing role should produce an error");
+    }
+
+    #[test]
+    fn test_tool_calls_missing_function_name() {
+        // tool_calls with missing function.name should error gracefully
+        let messages = json!([
+            {"role": "user", "content": "call a tool"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "function": {
+                        "arguments": "{\"x\": 1}"
+                    }
+                }]
+            }
+        ]);
+
+        let result =
+            encode_messages(messages.as_array().unwrap(), ThinkingMode::Thinking, true);
+
+        assert!(result.is_err(), "Missing function name should produce an error");
+    }
+
+    #[test]
+    fn test_tool_calls_arguments_not_valid_json() {
+        // arguments as non-JSON string should error, not panic
+        let messages = json!([
+            {"role": "user", "content": "call a tool"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "function": {
+                        "name": "test_fn",
+                        "arguments": "not valid json"
+                    }
+                }]
+            }
+        ]);
+
+        let result =
+            encode_messages(messages.as_array().unwrap(), ThinkingMode::Thinking, true);
+
+        assert!(result.is_err(), "Invalid JSON arguments should produce an error");
+    }
+
+    #[test]
+    fn test_tool_calls_arguments_not_object() {
+        // arguments as a JSON array instead of object should error
+        let messages = json!([
+            {"role": "user", "content": "call a tool"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "function": {
+                        "name": "test_fn",
+                        "arguments": "[1, 2, 3]"
+                    }
+                }]
+            }
+        ]);
+
+        let result =
+            encode_messages(messages.as_array().unwrap(), ThinkingMode::Thinking, true);
+
+        assert!(result.is_err(), "Non-object arguments should produce an error");
+    }
+
+    #[test]
+    fn test_unknown_role() {
+        // Unknown role should error, not panic
+        let messages = json!([
+            {"role": "alien", "content": "take me to your leader"}
+        ]);
+
+        let result =
+            encode_messages(messages.as_array().unwrap(), ThinkingMode::Thinking, true);
+
+        assert!(result.is_err(), "Unknown role should produce an error");
+    }
+
+    #[test]
+    fn test_empty_messages_array() {
+        // Empty messages should succeed (just BOS token)
+        let messages = json!([]);
+
+        let result =
+            encode_messages(messages.as_array().unwrap(), ThinkingMode::Thinking, true);
+
+        assert!(result.is_ok());
+        let prompt = result.unwrap();
+        assert!(prompt.starts_with(tokens::BOS));
+    }
+
+    #[test]
+    fn test_system_message_with_null_content() {
+        // System with content as null (not a string) should not panic
+        let messages = json!([
+            {"role": "system", "content": null},
+            {"role": "user", "content": "hi"}
+        ]);
+
+        let result =
+            encode_messages(messages.as_array().unwrap(), ThinkingMode::Thinking, true);
+
+        // Should succeed — null content treated as empty string
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_tool_result_without_preceding_assistant() {
+        // Tool message with no prior assistant should not panic
+        let messages = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "content": "result data"}
+        ]);
+
+        let result =
+            encode_messages(messages.as_array().unwrap(), ThinkingMode::Thinking, true);
+
+        // Should not panic regardless of whether it succeeds or errors
+        let _ = result;
+    }
+
+    #[test]
+    fn test_chat_mode_no_thinking_tags() {
+        // In Chat mode, thinking tags should not appear
+        let messages = json!([
+            {"role": "user", "content": "Hello!"}
+        ]);
+
+        let result =
+            encode_messages(messages.as_array().unwrap(), ThinkingMode::Chat, true).unwrap();
+
+        assert!(!result.contains(tokens::THINKING_START));
+        assert!(result.contains(tokens::THINKING_END));
+    }
+
+    #[test]
+    fn test_to_json_with_escaped_quotes() {
+        // Test the hand-rolled to_json function with strings containing quotes
+        let value = json!({"key": "value with \"quotes\""});
+        let result = to_json(&value);
+        // Must not corrupt the string
+        assert!(result.contains("value with \\\"quotes\\\""));
+    }
+
+    #[test]
+    fn test_to_json_with_nested_structures() {
+        // Nested objects/arrays should be formatted correctly
+        let value = json!({"a": {"b": [1, 2, 3]}, "c": "d"});
+        let result = to_json(&value);
+        // Should add spaces after colons and commas
+        assert!(result.contains(": "));
+    }
+
+    #[test]
+    fn test_reasoning_content_as_array() {
+        // reasoning_content can be an array of string segments
+        let messages = json!([
+            {"role": "user", "content": "think hard"},
+            {
+                "role": "assistant",
+                "reasoning_content": ["step 1", "step 2"],
+                "content": "answer"
+            }
+        ]);
+
+        let result =
+            encode_messages(messages.as_array().unwrap(), ThinkingMode::Thinking, true);
+
+        assert!(result.is_ok());
+        let prompt = result.unwrap();
+        assert!(prompt.contains("step 1"));
+        assert!(prompt.contains("step 2"));
+    }
+
+    #[test]
+    fn test_no_bos_token() {
+        let messages = json!([
+            {"role": "user", "content": "Hello!"}
+        ]);
+
+        let result =
+            encode_messages(messages.as_array().unwrap(), ThinkingMode::Thinking, false).unwrap();
+
+        assert!(!result.starts_with(tokens::BOS));
+    }
 }

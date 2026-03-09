@@ -1,0 +1,3 @@
+event: error
+: something went wrong
+

@@ -1,0 +1,30 @@
+# Runtime codec fuzzing dictionary
+
+# Two-part message header (24 bytes: header_len + body_len + checksum)
+"\x00\x00\x00\x00\x00\x00\x00\x00"
+"\x01\x00\x00\x00\x00\x00\x00\x00"
+"\xff\xff\xff\xff\xff\xff\xff\xff"
+
+# Frame header: version byte
+"\x01"
+"\x00"
+"\xff"
+
+# Frame payload lengths
+"\x00\x00\x00\x00"
+"\x01\x00\x00\x00"
+"\xff\xff\xff\xff"
+
+# TCP message path lengths
+"\x00\x00"
+"\x01\x00"
+"\xff\x03"
+
+# Common endpoint paths
+"/v1/chat"
+"/health"
+"/"
+
+# JSON for headers
+"{}"
+"{\"content-type\":\"application/json\"}"

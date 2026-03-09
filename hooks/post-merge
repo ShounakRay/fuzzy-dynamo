@@ -1,0 +1,8 @@
+#!/bin/sh
+# [Shounak] Auto-remove upstream CI workflows after merge (they require NVIDIA infra)
+if [ -d ".github/workflows" ]; then
+    git rm -r --quiet .github/workflows/ 2>/dev/null
+    if ! git diff --cached --quiet; then
+        git commit -m "chore: auto-remove upstream CI workflows"
+    fi
+fi

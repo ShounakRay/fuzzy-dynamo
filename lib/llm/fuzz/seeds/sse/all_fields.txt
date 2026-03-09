@@ -1,0 +1,5 @@
+id: 123
+event: message
+data: {"role":"assistant"}
+: comment
+

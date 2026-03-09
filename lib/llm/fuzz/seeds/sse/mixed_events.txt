@@ -1,0 +1,7 @@
+data: {"n":1}
+
+event: update
+data: {"n":2}
+
+data: [DONE]
+

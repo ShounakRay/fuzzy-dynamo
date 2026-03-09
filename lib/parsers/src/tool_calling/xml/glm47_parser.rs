@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use super::super::ToolDefinition;
 use super::super::config::Glm47ParserConfig;
+use super::super::utils::chunk_ends_with_token_prefix;
 use super::response::{CalledFunction, ToolCallResponse, ToolCallType};
 
 /// Check if a chunk contains the start of a GLM-4.7 tool call.
@@ -26,13 +27,7 @@ pub fn detect_tool_call_start_glm47(chunk: &str, config: &Glm47ParserConfig) -> 
     }
 
     // Check for partial match at the end of the chunk (for streaming)
-    for i in 1..start_token.len() {
-        if chunk.ends_with(&start_token[..i]) {
-            return true;
-        }
-    }
-
-    false
+    chunk_ends_with_token_prefix(chunk, start_token)
 }
 
 /// Find the end position of a GLM-4.7 tool call.
@@ -117,16 +112,6 @@ fn extract_tool_calls(
 
     let normal_text = normal_parts.join("").trim().to_string();
     Ok((normal_text, calls))
-}
-
-/// Decode XML character entities in a string.
-/// Handles the five predefined XML entities: &lt; &gt; &amp; &quot; &apos;
-fn decode_xml_entities(s: &str) -> String {
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
 }
 
 /// Coerce a raw string value to a JSON Value using the tool's parameter schema.
@@ -252,7 +237,7 @@ fn parse_tool_call_block(
 
         if !key.is_empty() {
             // Decode XML entities (e.g. &lt; → <, &amp; → &) before parsing
-            let decoded = decode_xml_entities(raw_value);
+            let decoded = super::super::utils::decode_xml_entities(raw_value);
 
             // Look up the expected type from the tool's parameter schema
             let schema_type = get_param_schema_type(tools, &function_name, key);
@@ -286,6 +271,17 @@ mod tests {
 
     fn get_test_config() -> Glm47ParserConfig {
         Glm47ParserConfig::default()
+    }
+
+    #[test]
+    fn test_detect_tool_call_start_with_unicode_token_no_panic() {
+        // Previously panicked due to byte-based slicing on multibyte UTF-8 tokens.
+        // Fixed by using character-based iteration via chunk_ends_with_token_prefix().
+        let config = Glm47ParserConfig {
+            tool_call_start: "<\u{5DE5}\u{5177}>".to_string(), // "<工具>"
+            ..get_test_config()
+        };
+        assert!(detect_tool_call_start_glm47("partial <\u{5DE5}", &config));
     }
 
     #[test]
@@ -567,6 +563,48 @@ mod tests {
         let ids = args.get("ids").unwrap().as_array().unwrap();
         assert_eq!(ids.len(), 3);
         assert_eq!(ids[0].as_i64().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_trim_offset_bug_ascii_with_leading_whitespace() {
+        // BUG: content[function_name.len()..] uses the trimmed name's byte
+        // length as an offset into the untrimmed content. With leading whitespace,
+        // the offset is wrong. For ASCII this silently mangles the args_section
+        // but the regex still finds args correctly. See the UTF-8 variant below
+        // for the crash case.
+        let config = get_test_config();
+        let message = "<tool_call> get_weather<arg_key>location</arg_key><arg_value>NYC</arg_value></tool_call>";
+
+        let (calls, _) = try_tool_call_parse_glm47(message, &config, None).unwrap();
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+
+        let args: HashMap<String, Value> =
+            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(
+            args.get("location").unwrap().as_str().unwrap(),
+            "NYC",
+            "Leading whitespace before function name causes trim offset bug: \
+             function_name.len() != original position, mangling the args section"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "byte index")]
+    fn test_trim_offset_panics_with_multibyte_utf8_function_name() {
+        // BUG (crash): When a multibyte UTF-8 function name has leading whitespace,
+        // the trim offset mismatch causes slicing at a non-char-boundary.
+        //
+        // content = " \u{83B7}\u{53D6}\u{5929}\u{6C14}<arg_key>..." (space + 4 CJK chars)
+        // function_name = "\u{83B7}\u{53D6}\u{5929}\u{6C14}" (trimmed, 12 bytes)
+        // &content[12..] panics because byte 12 is inside the last CJK char,
+        // not at a char boundary (the char boundary is at byte 13).
+        let config = get_test_config();
+        let message = "<tool_call> \u{83B7}\u{53D6}\u{5929}\u{6C14}<arg_key>location</arg_key><arg_value>NYC</arg_value></tool_call>";
+
+        // This panics with "byte index 12 is not a char boundary"
+        let _ = try_tool_call_parse_glm47(message, &config, None);
     }
 
     #[test]

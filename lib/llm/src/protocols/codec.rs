@@ -741,4 +741,149 @@ data: [DONE]
         assert!(annotated.data.is_none());
         assert_eq!(annotated.event, Some("update".to_string()));
     }
+
+    // Regression tests for SSE codec edge cases
+
+    #[tokio::test]
+    async fn test_unbounded_data_without_blank_line_terminator() {
+        // data: lines accumulate until a blank line dispatches the event.
+        // If no blank line is provided the codec must not panic; it should
+        // return None (no complete event yet) and buffer internally.
+        let input = "data: line1\ndata: line2\ndata: line3\n";
+        let cursor = Cursor::new(input);
+        let mut framed = FramedRead::new(cursor, SseLineCodec::new());
+
+        // No blank line → decode returns None for each poll, then EOF flushes
+        let mut messages = Vec::new();
+        while let Some(result) = framed.next().await {
+            let msg = result.expect("decode must not panic");
+            messages.push(msg);
+        }
+        // EOF should dispatch the buffered data as a single event
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].data.as_deref(), Some("line1\nline2\nline3"));
+    }
+
+    #[tokio::test]
+    async fn test_interleaved_event_data_id_fields() {
+        // Fields can arrive in any order per the SSE spec
+        let input = "id: 42\ndata: first\nevent: update\ndata: second\n\n";
+        let cursor = Cursor::new(input);
+        let mut framed = FramedRead::new(cursor, SseLineCodec::new());
+
+        let msg = framed.next().await.unwrap().unwrap();
+        assert_eq!(msg.id.as_deref(), Some("42"));
+        assert_eq!(msg.event.as_deref(), Some("update"));
+        // Multiple data: lines are joined with newlines
+        assert_eq!(msg.data.as_deref(), Some("first\nsecond"));
+    }
+
+    #[tokio::test]
+    async fn test_data_done_is_ignored() {
+        // data: [DONE] is a special sentinel that should not accumulate
+        let input = "data: [DONE]\n\n";
+        let cursor = Cursor::new(input);
+        let mut framed = FramedRead::new(cursor, SseLineCodec::new());
+
+        // The blank line dispatches but data_buffer should be empty
+        // since [DONE] is filtered. However comments/event/id are also empty,
+        // so nothing dispatches — the loop continues and EOF returns None.
+        let mut count = 0;
+        while let Some(result) = framed.next().await {
+            let _msg = result.expect("must not panic");
+            count += 1;
+        }
+        // [DONE] is skipped and no other fields → no event dispatched
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_id_field_with_null_byte_rejected() {
+        // Per SSE spec, id fields containing NUL are ignored
+        let input = "id: has\0null\ndata: {\"message\": \"test\"}\n\n";
+        let cursor = Cursor::new(input);
+        let mut framed = FramedRead::new(cursor, SseLineCodec::new());
+
+        let msg = framed.next().await.unwrap().unwrap();
+        // id should be None because it contained a null byte
+        assert_eq!(msg.id, None);
+        assert!(msg.data.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_empty_field_values() {
+        // Fields with no value after the colon
+        let input = "data:\nevent:\nid:\n\n";
+        let cursor = Cursor::new(input);
+        let mut framed = FramedRead::new(cursor, SseLineCodec::new());
+
+        let msg = framed.next().await.unwrap().unwrap();
+        // Empty strings should be handled gracefully
+        assert!(msg.data.is_none() || msg.data.as_deref() == Some(""));
+    }
+
+    #[tokio::test]
+    async fn test_consecutive_blank_lines() {
+        // Multiple blank lines should not cause panics or spurious events
+        let input = "\n\n\ndata: hello\n\n\n\n";
+        let cursor = Cursor::new(input);
+        let mut framed = FramedRead::new(cursor, SseLineCodec::new());
+
+        let mut messages = Vec::new();
+        while let Some(result) = framed.next().await {
+            messages.push(result.expect("must not panic"));
+        }
+        // Only one real event with data
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].data.as_deref(), Some("hello"));
+    }
+
+    #[tokio::test]
+    async fn test_field_without_colon() {
+        // A line without a colon is treated as field name with empty value
+        let input = "data\n\n";
+        let cursor = Cursor::new(input);
+        let mut framed = FramedRead::new(cursor, SseLineCodec::new());
+
+        // Should not panic
+        let mut count = 0;
+        while let Some(result) = framed.next().await {
+            let _msg = result.expect("must not panic");
+            count += 1;
+        }
+        // "data" with empty value doesn't accumulate [DONE], just empty string
+        // but empty string is still pushed into data_buffer as ""
+        assert!(count <= 1);
+    }
+
+    #[tokio::test]
+    async fn test_comment_only_event() {
+        // An event with only comments should still dispatch
+        let input = ": this is a comment\n: another comment\n\n";
+        let cursor = Cursor::new(input);
+        let mut framed = FramedRead::new(cursor, SseLineCodec::new());
+
+        let msg = framed.next().await.unwrap().unwrap();
+        assert!(msg.data.is_none());
+        assert!(msg.comments.is_some());
+        let comments = msg.comments.unwrap();
+        assert_eq!(comments.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_large_data_accumulation() {
+        // Simulate many data: lines to test buffer growth doesn't panic
+        let mut input = String::new();
+        for i in 0..1000 {
+            input.push_str(&format!("data: line {}\n", i));
+        }
+        input.push('\n');
+
+        let cursor = Cursor::new(input);
+        let mut framed = FramedRead::new(cursor, SseLineCodec::new());
+
+        let msg = framed.next().await.unwrap().unwrap();
+        let data = msg.data.unwrap();
+        assert_eq!(data.lines().count(), 1000);
+    }
 }

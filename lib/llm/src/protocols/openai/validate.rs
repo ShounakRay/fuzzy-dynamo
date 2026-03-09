@@ -667,3 +667,257 @@ where
     }
     Ok(Some(value))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // validate_logit_bias regression tests
+
+    #[test]
+    fn test_logit_bias_with_non_numeric_value() {
+        let mut bias = HashMap::new();
+        bias.insert("42".to_string(), serde_json::json!("not a number"));
+        let result = validate_logit_bias(&Some(bias));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("must be a number"));
+    }
+
+    #[test]
+    fn test_logit_bias_with_null_value() {
+        let mut bias = HashMap::new();
+        bias.insert("42".to_string(), serde_json::json!(null));
+        let result = validate_logit_bias(&Some(bias));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_logit_bias_with_boolean_value() {
+        let mut bias = HashMap::new();
+        bias.insert("42".to_string(), serde_json::json!(true));
+        let result = validate_logit_bias(&Some(bias));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_logit_bias_with_array_value() {
+        let mut bias = HashMap::new();
+        bias.insert("42".to_string(), serde_json::json!([1, 2, 3]));
+        let result = validate_logit_bias(&Some(bias));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_logit_bias_with_object_value() {
+        let mut bias = HashMap::new();
+        bias.insert("42".to_string(), serde_json::json!({"nested": "obj"}));
+        let result = validate_logit_bias(&Some(bias));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_logit_bias_at_boundaries() {
+        let mut bias = HashMap::new();
+        bias.insert("1".to_string(), serde_json::json!(100.0));
+        assert!(validate_logit_bias(&Some(bias)).is_ok());
+
+        let mut bias = HashMap::new();
+        bias.insert("1".to_string(), serde_json::json!(-100.0));
+        assert!(validate_logit_bias(&Some(bias)).is_ok());
+
+        let mut bias = HashMap::new();
+        bias.insert("1".to_string(), serde_json::json!(100.1));
+        assert!(validate_logit_bias(&Some(bias)).is_err());
+
+        let mut bias = HashMap::new();
+        bias.insert("1".to_string(), serde_json::json!(-100.1));
+        assert!(validate_logit_bias(&Some(bias)).is_err());
+    }
+
+    #[test]
+    fn test_logit_bias_none() {
+        assert!(validate_logit_bias(&None).is_ok());
+    }
+
+    #[test]
+    fn test_logit_bias_empty_map() {
+        let bias = HashMap::new();
+        assert!(validate_logit_bias(&Some(bias)).is_ok());
+    }
+
+    // validate_prompt_embeds regression tests
+
+    #[test]
+    fn test_prompt_embeds_not_base64() {
+        let result = validate_prompt_embeds(Some("!!!not-base64!!!"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_prompt_embeds_too_small() {
+        use base64::{Engine as _, engine::general_purpose};
+        // 50 bytes — under the 100-byte minimum
+        let data = vec![0u8; 50];
+        let encoded = general_purpose::STANDARD.encode(&data);
+        let result = validate_prompt_embeds(Some(&encoded));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("at least"));
+    }
+
+    #[test]
+    fn test_prompt_embeds_valid_minimum() {
+        use base64::{Engine as _, engine::general_purpose};
+        // Exactly 100 bytes
+        let data = vec![0u8; 100];
+        let encoded = general_purpose::STANDARD.encode(&data);
+        let result = validate_prompt_embeds(Some(&encoded));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_prompt_embeds_none() {
+        assert!(validate_prompt_embeds(None).is_ok());
+    }
+
+    #[test]
+    fn test_prompt_embeds_empty_string() {
+        let result = validate_prompt_embeds(Some(""));
+        // Empty string decodes to empty bytes, which is < 100 min
+        assert!(result.is_err());
+    }
+
+    // validate_range regression tests
+
+    #[test]
+    fn test_validate_range_none() {
+        let result = validate_range::<f32>(None, &(0.0, 1.0));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    fn test_validate_range_in_bounds() {
+        let result = validate_range(Some(0.5f32), &(0.0, 1.0));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some(0.5));
+    }
+
+    #[test]
+    fn test_validate_range_at_boundaries() {
+        assert!(validate_range(Some(0.0f32), &(0.0, 1.0)).is_ok());
+        assert!(validate_range(Some(1.0f32), &(0.0, 1.0)).is_ok());
+    }
+
+    #[test]
+    fn test_validate_range_out_of_bounds() {
+        assert!(validate_range(Some(-0.1f32), &(0.0, 1.0)).is_err());
+        assert!(validate_range(Some(1.1f32), &(0.0, 1.0)).is_err());
+    }
+
+    // validate_temperature regression tests
+
+    #[test]
+    fn test_temperature_boundaries() {
+        assert!(validate_temperature(Some(0.0)).is_ok());
+        assert!(validate_temperature(Some(2.0)).is_ok());
+        assert!(validate_temperature(Some(-0.1)).is_err());
+        assert!(validate_temperature(Some(2.1)).is_err());
+        assert!(validate_temperature(None).is_ok());
+    }
+
+    // validate_max_tokens regression tests
+
+    #[test]
+    fn test_max_tokens_zero() {
+        assert!(validate_max_tokens(Some(0)).is_err());
+    }
+
+    #[test]
+    fn test_max_tokens_positive() {
+        assert!(validate_max_tokens(Some(1)).is_ok());
+        assert!(validate_max_tokens(Some(u32::MAX)).is_ok());
+    }
+
+    #[test]
+    fn test_max_tokens_none() {
+        assert!(validate_max_tokens(None).is_ok());
+    }
+
+    // validate_model regression tests
+
+    #[test]
+    fn test_model_empty() {
+        assert!(validate_model("").is_err());
+        assert!(validate_model("   ").is_err());
+    }
+
+    #[test]
+    fn test_model_valid() {
+        assert!(validate_model("gpt-4").is_ok());
+    }
+
+    // validate_suffix regression tests
+
+    #[test]
+    fn test_suffix_too_long() {
+        let long = "a".repeat(10001);
+        assert!(validate_suffix(Some(&long)).is_err());
+    }
+
+    #[test]
+    fn test_suffix_at_limit() {
+        let max = "a".repeat(10000);
+        assert!(validate_suffix(Some(&max)).is_ok());
+    }
+
+    // validate_n_with_temperature interaction
+
+    #[test]
+    fn test_n_greater_than_1_with_zero_temperature() {
+        assert!(validate_n_with_temperature(Some(2), Some(0.0)).is_err());
+    }
+
+    #[test]
+    fn test_n_1_with_zero_temperature() {
+        assert!(validate_n_with_temperature(Some(1), Some(0.0)).is_ok());
+    }
+
+    // validate_no_unsupported_fields
+
+    #[test]
+    fn test_unsupported_fields_present() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("unknown_field".to_string(), serde_json::json!(42));
+        assert!(validate_no_unsupported_fields(&fields).is_err());
+    }
+
+    #[test]
+    fn test_unsupported_fields_empty() {
+        let fields = std::collections::HashMap::new();
+        assert!(validate_no_unsupported_fields(&fields).is_ok());
+    }
+
+    // validate_repetition_penalty edge cases
+
+    #[test]
+    fn test_repetition_penalty_zero() {
+        // 0.0 is MIN, but the check is `penalty <= MIN` so 0.0 should fail
+        assert!(validate_repetition_penalty(Some(0.0)).is_err());
+    }
+
+    #[test]
+    fn test_repetition_penalty_just_above_zero() {
+        assert!(validate_repetition_penalty(Some(0.01)).is_ok());
+    }
+
+    #[test]
+    fn test_repetition_penalty_at_max() {
+        assert!(validate_repetition_penalty(Some(2.0)).is_ok());
+    }
+
+    #[test]
+    fn test_repetition_penalty_above_max() {
+        assert!(validate_repetition_penalty(Some(2.1)).is_err());
+    }
+}

@@ -1,0 +1,29 @@
+# SSE field names
+"data: "
+"event: "
+"id: "
+"retry: "
+": "
+
+# SSE values
+"[DONE]"
+"error"
+"message"
+"update"
+
+# Line terminators (raw hex)
+"\x0a"
+"\x0d\x0a"
+"\x0a\x0a"
+"\x0d\x0a\x0d\x0a"
+
+# JSON fragments
+"{\"content\":\""
+"{\"message\":\""
+"{\"choices\":["
+"null"
+"true"
+"false"
+
+# Null byte (for id rejection testing)
+"\x00"
