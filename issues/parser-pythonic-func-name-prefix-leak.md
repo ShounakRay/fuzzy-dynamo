@@ -1,12 +1,17 @@
-# Pythonic tool call parser includes prefix text in function name
+# Pythonic tool call parser absorbs prefix characters into function name
 
 ## Summary
 
-`try_tool_call_parse_pythonic` incorrectly includes characters from surrounding text in the extracted function name. When a tool call like `get_weather(location="NYC")` is embedded in arbitrary text, the parser may include adjacent characters as part of the function name.
+`try_tool_call_parse_pythonic` incorrectly includes characters from surrounding
+text in the extracted function name. When a tool call like
+`get_weather(location="NYC")` is embedded in arbitrary text, the parser absorbs
+adjacent identifier characters as part of the function name.
 
 ## Severity
 
-**High** — Incorrect function name extraction means tool calls are dispatched to the wrong function. In LLM inference serving, this causes tool call failures or, worse, calling the wrong tool with valid arguments.
+**High** — Incorrect function name extraction means tool calls are dispatched to
+the wrong function. In LLM inference serving, this causes tool call failures or,
+worse, calling the wrong tool with valid arguments.
 
 ## Steps to Reproduce
 
@@ -32,9 +37,11 @@ let (calls, _) = try_tool_call_parse_pythonic(input, None).unwrap();
 
 ## Root Cause
 
-The pythonic parser scans backward from `(` to find the function name start. It likely uses a character class (e.g., `[a-zA-Z0-9_]`) to determine which characters belong to the function name. Characters like `v`, `m`, etc. that immediately precede `get_weather` without a separator are incorrectly included because they match the identifier character class.
-
-The parser should require that the function name starts at a word boundary — i.e., the character before the function name should NOT be an identifier character.
+The pythonic parser regex at `pythonic_parser.rs:22` uses pattern `[a-zA-Z]+\w*\(`
+which does not enforce a word boundary before the function name. Characters like
+`v`, `m`, etc. that immediately precede the real function name match the
+`[a-zA-Z]` class and get absorbed because there's no assertion that the
+preceding character is NOT an identifier character.
 
 ## Crash Artifacts
 
@@ -43,6 +50,8 @@ The parser should require that the function name starts at a word boundary — i
 
 ## Suggested Fix
 
-When scanning backward from `(` to find the function name, stop at the first non-identifier character AND verify the character before the function name start is not an identifier character. This ensures we extract only complete identifiers, not fragments of surrounding text.
+Add a word boundary or lookbehind assertion to the regex so the function name
+must start at a word boundary — i.e., the character before the function name
+should NOT be an identifier character (`\b` or `(?<![a-zA-Z0-9_])`).
 
 Found by: `fuzz_parser_semantic` fuzzer.

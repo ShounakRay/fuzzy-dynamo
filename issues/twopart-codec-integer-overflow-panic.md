@@ -1,5 +1,7 @@
 # TwoPartCodec integer overflow panic on crafted network input
 
+> **Status: FIXED** — We filed this upstream as issue #6955. Fix merged in PR #6959 using checked arithmetic.
+
 ## Summary
 
 The `TwoPartCodec::decode` method panics with "attempt to add with overflow" when processing network input containing large `header_len` or `body_len` values. The overflow occurs before the `max_message_size` safety check, making even size-limited codecs vulnerable.

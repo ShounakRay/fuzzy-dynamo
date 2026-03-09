@@ -1,5 +1,7 @@
 # RadixTree underreports overlap scores vs PositionalIndexer
 
+> **Status: FIXED** — The `find_matches` logic was substantially rewritten in upstream PRs #5973 and #6122. The scoring now properly tracks `matched_depth` along tree paths.
+
 ## Summary
 
 The `RadixTree` indexer's `find_matches` returns lower overlap scores than `PositionalIndexer` for the same stored blocks and query sequence. Specifically, when a worker has stored blocks that fully cover a query, RadixTree reports a score of 1 instead of the correct value (e.g., 3 for a 3-block query).
