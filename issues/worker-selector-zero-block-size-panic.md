@@ -1,4 +1,4 @@
-# DefaultWorkerSelector::select_worker panics on zero block_size
+# Bug 12: DefaultWorkerSelector::select_worker panics on zero block_size
 
 ## Summary
 

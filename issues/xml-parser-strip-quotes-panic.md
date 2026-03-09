@@ -1,4 +1,4 @@
-# XML parser strip_quotes panics on single-character quote input
+# Bug 13: XML parser strip_quotes panics on single-character quote input
 
 ## Summary
 

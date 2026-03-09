@@ -1,4 +1,4 @@
-# RequestExtraInfo::to_block_level panics on zero block_size
+# Bug 11: RequestExtraInfo::to_block_level panics on zero block_size
 
 ## Summary
 

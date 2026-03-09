@@ -1,4 +1,4 @@
-# compute_block_hash_for_seq panics on zero kv_block_size
+# Bug 1: compute_block_hash_for_seq panics on zero kv_block_size
 
 ## Summary
 

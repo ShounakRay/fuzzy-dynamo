@@ -1,4 +1,4 @@
-# MiniMaxAppendThink parser: streaming vs one-shot reasoning mismatch on trailing newlines
+# Bug 10: MiniMaxAppendThink parser: streaming vs one-shot reasoning mismatch on trailing newlines
 
 ## Summary
 

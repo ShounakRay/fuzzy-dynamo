@@ -1,4 +1,4 @@
-# Pythonic tool call parser absorbs prefix characters into function name
+# Bug 6: Pythonic tool call parser absorbs prefix characters into function name
 
 ## Summary
 

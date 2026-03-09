@@ -1,4 +1,4 @@
-# TwoPartCodec integer overflow panic on crafted network input
+# Bug 16: TwoPartCodec integer overflow panic on crafted network input
 
 > **Status: FIXED** — We filed this upstream as issue #6955. Fix merged in PR #6959 using checked arithmetic.
 

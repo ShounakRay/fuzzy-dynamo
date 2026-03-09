@@ -1,4 +1,4 @@
-# RadixTree underreports overlap scores vs PositionalIndexer
+# Bug 15: RadixTree underreports overlap scores vs PositionalIndexer
 
 > **Status: FIXED** — The `find_matches` logic was substantially rewritten in upstream PRs #5973 and #6122. The scoring now properly tracks `matched_depth` along tree paths.
 

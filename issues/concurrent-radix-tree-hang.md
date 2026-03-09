@@ -1,4 +1,4 @@
-# ConcurrentRadixTree: Deadlock on Duplicate Block Hashes
+# Bug 2: ConcurrentRadixTree: Deadlock on Duplicate Block Hashes
 
 ## Summary
 

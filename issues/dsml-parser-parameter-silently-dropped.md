@@ -1,4 +1,4 @@
-# DSML parser silently drops parameters with capitalized or missing string attribute
+# Bug 7: DSML parser silently drops parameters with capitalized or missing string attribute
 
 ## Summary
 

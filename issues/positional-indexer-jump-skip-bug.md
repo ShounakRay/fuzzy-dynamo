@@ -1,4 +1,4 @@
-# PositionalIndexer: Jump optimization skips removed blocks, producing incorrect scores
+# Bug 4: PositionalIndexer: Jump optimization skips removed blocks, producing incorrect scores
 
 ## Summary
 

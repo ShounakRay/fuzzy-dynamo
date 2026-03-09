@@ -1,4 +1,4 @@
-# KimiK2 parser: OnceLock caches regex from first config, ignores subsequent configs
+# Bug 9: KimiK2 parser: OnceLock caches regex from first config, ignores subsequent configs
 
 ## Summary
 

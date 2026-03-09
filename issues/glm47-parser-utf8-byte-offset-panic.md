@@ -1,4 +1,4 @@
-# GLM-4.7 parser panics on multibyte UTF-8 function names with leading whitespace
+# Bug 3: GLM-4.7 parser panics on multibyte UTF-8 function names with leading whitespace
 
 ## Summary
 

@@ -1,4 +1,4 @@
-# Granite Parser: Streaming vs Oneshot Normal Text Mismatch
+# Bug 8: Granite Parser: Streaming vs Oneshot Normal Text Mismatch
 
 ## Summary
 
