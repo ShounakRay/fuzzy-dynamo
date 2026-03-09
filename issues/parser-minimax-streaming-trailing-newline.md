@@ -41,6 +41,7 @@ All reproduce the same MiniMaxAppendThink trailing-newline issue:
 - `crash-0a7d38b66474cdd18da409ae817d44c1fb8fba74` — input `";\n"`
 - `crash-3f3d2d8955322f325af6db2238355fa07007ebd9` — input `"\n\n\n\n"`
 - `crash-c94a19860d21a1bf9b45bfa7f279e9c3bce017d2` — input `"+\n:\n"`
+- `crash-44436640b12392d87c7b96a66d6afac743db368f` — input `"\nH"` (leading newline stripped in one-shot, kept in streaming)
 
 ## Suggested Fix
 

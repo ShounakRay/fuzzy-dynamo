@@ -89,3 +89,8 @@ doc = false
 name = "fuzz_zmq_e2e"
 path = "fuzz_targets/fuzz_zmq_e2e.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_worker_selector_div"
+path = "fuzz_targets/fuzz_worker_selector_div.rs"
+doc = false
