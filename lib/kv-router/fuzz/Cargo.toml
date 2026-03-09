@@ -79,3 +79,8 @@ doc = false
 name = "fuzz_concurrent_stress"
 path = "fuzz_targets/fuzz_concurrent_stress.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_stored_blocks"
+path = "fuzz_targets/fuzz_stored_blocks.rs"
+doc = false
