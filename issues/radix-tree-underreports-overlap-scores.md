@@ -48,7 +48,13 @@ Three independent crash inputs all show the same pattern:
 - The ConcurrentRadixTree agrees with RadixTree (same underlying tree logic)
 - Only PositionalIndexer gives the correct score
 
-This suggests the bug is in the shared radix tree traversal logic, likely in `lib/kv-router/src/indexer/radix_tree.rs` in the `find_matches` method.
+The RadixTree's `find_matches` walks children from root, tracking `matched_depth` as it descends. It only increments depth for nodes it visits. If the tree structure doesn't form a contiguous path matching the query (e.g., due to how events are applied), some workers may appear only at the first node and drop out, getting score 1 instead of the correct depth.
+
+The PositionalIndexer uses a position-based lookup (`jump_search_matches`) where each block is indexed by its position in the sequence, so it correctly counts all positions where a worker has matching blocks.
+
+The root cause is likely in `RadixTree::apply_event` — the tree structure after Store events may not correctly represent the full sequence, causing `find_matches` to see only partial matches.
+
+Code: `lib/kv-router/src/indexer/radix_tree.rs:156-314`.
 
 ## Crash Artifacts
 
