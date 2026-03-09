@@ -92,3 +92,8 @@ doc = false
 name = "fuzz_glm47_utf8"
 path = "fuzz_targets/fuzz_glm47_utf8.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_xml_deep"
+path = "fuzz_targets/fuzz_xml_deep.rs"
+doc = false

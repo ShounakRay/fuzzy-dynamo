@@ -867,6 +867,7 @@ dependencies = [
  "arbitrary",
  "dynamo-kv-router",
  "libfuzzer-sys",
+ "rmp-serde",
  "rustc-hash",
  "serde_json",
 ]

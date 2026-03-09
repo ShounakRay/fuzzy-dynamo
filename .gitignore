@@ -166,3 +166,4 @@ fuzzing/*.lot
 fuzzing/*.idx
 fuzzing/*.ind
 fuzzing/*.ilg
+/coverage/
