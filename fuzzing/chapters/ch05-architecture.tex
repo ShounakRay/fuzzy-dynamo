@@ -3,7 +3,6 @@
 
 The previous chapters introduced the building blocks: transformer attention, KV caching, and distributed inference techniques. This chapter assembles them into the concrete system that is NVIDIA Dynamo. We trace a single request from the moment it arrives as an HTTP payload to the moment the last token streams back to the client, identifying every component it touches along the way. By the end, you will have a complete map of Dynamo's architecture---what each component does, why it exists, and how it communicates with its neighbors.
 
-
 %% ============================================================
 \section{A Request's Journey}
 \label{sec:architecture:journey}
@@ -152,7 +151,6 @@ The entire journey---from HTTP request to first token---is called \emph{time to 
 \label{fig:request-journey}
 \end{figure}
 
-
 %% ============================================================
 \section{Service Discovery}
 \label{sec:architecture:discovery}
@@ -180,9 +178,9 @@ Three backends implement this trait:
 \begin{itemize}
   \item \textbf{\texttt{KVStoreDiscovery}}: uses an abstract key-value store interface (\texttt{kv::Manager}), which is backed by either etcd or NATS JetStream depending on configuration. This is the primary backend for standalone deployments. Keys are hierarchically structured:
 
-\smallskip
+
 \texttt{v1/instances/\{namespace\}/\{component\}/\{endpoint\}/\{instance\_id\}}
-\smallskip
+
 
   \item \textbf{\texttt{KubeDiscoveryClient}}: uses the Kubernetes API server (via the \texttt{kube} crate) for service discovery in cloud-native deployments. Workers are discovered by watching Kubernetes EndpointSlice resources with appropriate labels.
 
@@ -225,7 +223,6 @@ A \texttt{Namespace} groups related components (e.g., a particular model deploym
 \begin{insightbox}
 The discovery hierarchy maps directly to the scaling model. A Kubernetes Horizontal Pod Autoscaler watches metrics for a specific component and scales that component's pods independently. The discovery plane propagates the change to all interested parties. This is why Dynamo can disaggregate prefill and decode workers: each is a separate component with independent scaling policies.
 \end{insightbox}
-
 
 %% ============================================================
 \section{Communication Planes}
@@ -296,7 +293,6 @@ External & Client API & HTTP + SSE & JSON (OpenAI format) \\
 \bottomrule
 \end{tabular}
 \end{center}
-
 
 %% ============================================================
 \section{The Rust-Python Bridge (PyO3)}
@@ -388,7 +384,6 @@ Pipeline composition & Python & Operator ergonomics; configuration, not performa
 \begin{insightbox}
 The PyO3 boundary is crossed \emph{per-request}, not \emph{per-token}. Once a Python engine's generator is started, tokens flow back through the Rust-Python bridge as individual yield points. But the expensive part---GPU kernel launches, attention computation, KV cache management---happens entirely within the Python inference engine's C++/CUDA runtime, not in Python bytecode. The GIL is a bottleneck only for the brief moments of object conversion, not for computation.
 \end{insightbox}
-
 
 %% ============================================================
 \section{Component Map}
@@ -503,7 +498,6 @@ The crate dependency structure forms a layered architecture:
 
 \texttt{dynamo-config} sits at the base, providing configuration to all crates. \texttt{dynamo-runtime} builds on it with the distributed runtime (discovery, transports, pipeline framework). \texttt{dynamo-kv-router} depends on the runtime for communication and on \texttt{dynamo-tokens} for block hashing. \texttt{dynamo-llm} integrates everything: it depends on the runtime, the KV router, the token crate, the memory crate, and the parser crate. Finally, \texttt{dynamo-py3} sits at the top, exposing \texttt{dynamo-llm} and \texttt{dynamo-runtime} to Python.
 
-
 %% ============================================================
 \section{Summary}
 \label{sec:architecture:summary}
@@ -523,16 +517,16 @@ The crate dependency structure forms a layered architecture:
   \item Dynamo is a \textbf{polyglot system}: Rust, Python, Go, and C++ each handle the components best suited to their strengths, with integration complexity concentrated at language boundaries.
 \end{itemize}
 
-\bigskip
+\medskip
 \begin{center}\rule{0.5\linewidth}{0.4pt}\end{center}
-\bigskip
+\medskip
 
 With the architecture mapped, we can now zoom into the component that makes Dynamo's routing unique: the KV-aware radix tree that decides which GPU should handle each request.
 
-\bigskip
+\medskip
 \noindent\textbf{Check Your Understanding}
 
-\medskip
+\smallskip
 \noindent\emph{These questions are answerable from this chapter alone.}
 
 \begin{enumerate}
@@ -553,7 +547,7 @@ With the architecture mapped, we can now zoom into the component that makes Dyna
   \item Look at the crate dependency graph. Why does \texttt{dynamo-kv-router} depend on \texttt{dynamo-tokens} but not on \texttt{dynamo-llm}? What architectural principle does this reflect?
 \end{enumerate}
 
-\bigskip
+\medskip
 \noindent\textbf{Answers}
 
 \medskip

@@ -5,7 +5,6 @@ This is the payoff chapter. The previous chapters built the infrastructure---fuz
 
 Some of these bugs are embarrassing---a division by zero where the divisor comes from configuration, a string slice at a non-character boundary. Others are subtle---a tree traversal that miscounts matched blocks, a streaming parser that silently drops the first token. Together, they paint a picture of a codebase that is memory-safe (thanks to Rust) but far from bug-free, and of a testing methodology where fuzzing and human reasoning each catch different classes of defect.
 
-
 \section{Bug Census}
 \label{sec:findings:census}
 
@@ -65,7 +64,6 @@ The parser zoo---Dynamo's collection of model-specific output parsers---is the s
 \begin{whynotbox}{Why not just fix the bugs?}
 A natural question: if you found 16 bugs, why document them instead of submitting patches? Three reasons make documentation the higher-value first step. First, the correct fix often requires design decisions that only the maintainers can make. The KimiK2 \texttt{OnceLock} bug (Bug~\#11) could be fixed by removing caching entirely, by keying on configuration tokens, or by restructuring how parsers are instantiated---each has different performance and API implications. A bug report with root cause analysis lets the maintainers choose; a patch forces a particular design. Second, some bugs interact with other bugs. The three division-by-zero bugs (\#14--\#16) share a root cause (unvalidated \texttt{kv\_block\_size}), so the right fix is a single validation at the configuration boundary, not three separate guards. Documentation of the full set makes this pattern visible. Third, bug reports have pedagogical value that patches lack. A report explaining \emph{why} \texttt{trim().len()} is not a valid byte index (Bug~\#1) teaches a pattern that prevents an entire class of future bugs. A one-line patch teaches nothing. Two bugs \emph{were} fixed upstream during the campaign (Bugs~\#3 and \#6), demonstrating that good documentation naturally leads to fixes.
 \end{whynotbox}
-
 
 \section{Crash Bugs}
 \label{sec:findings:crashes}
@@ -205,7 +203,6 @@ This bug was found by the triple differential fuzzer comparing \texttt{RadixTree
 Bugs~\#5 and \#6 form a complementary pair: the RadixTree \emph{underreports} scores while the PositionalIndexer \emph{overreports} them after removals. Neither indexer was correct for all inputs. The triple differential fuzzer caught both because it compared three implementations---any pairwise disagreement was flagged, regardless of which implementation was wrong.
 \end{notebox}
 
-
 \section{Logic Bugs}
 \label{sec:findings:logic}
 
@@ -340,7 +337,6 @@ The replacements are applied globally to all occurrences, not just standalone Py
 The DSML, KimiK2, and XML bugs share a common theme: \emph{silent failure on unexpected input}. None of them crash---the parser simply produces wrong output and returns successfully. Without a specification-aware oracle (differential test, property assertion, or manual code review), these bugs are invisible to any amount of fuzzing.
 \end{notebox}
 
-
 \section{Arithmetic Bugs}
 \label{sec:findings:arithmetic}
 
@@ -390,7 +386,6 @@ fn strip_quotes(s: &str) -> &str {
 Fix: add \texttt{trimmed.len() >= 2} to the guard condition.
 \end{bugbox}
 
-
 \section{Debug vs Release Divergence}
 \label{sec:findings:divergence}
 
@@ -435,7 +430,6 @@ This configuration flag makes release builds panic on overflow just like debug b
 The debug/release divergence means that fuzzing in debug mode (the default) catches a \emph{superset} of the arithmetic bugs that exist in release mode. This is generally desirable---you want to find bugs early. But it also means you cannot assume that a crash found by the fuzzer will manifest the same way in production. Our campaign ran in debug mode and flagged overflows as crashes, then manually verified whether the silent wraparound in release mode had security or correctness implications. For the TwoPartCodec, it did.
 \end{notebox}
 
-
 \section{What Fuzzing Found vs Code Audit}
 \label{sec:findings:comparison}
 
@@ -472,7 +466,6 @@ Consider the counterfactual: a team with only a crash-based fuzzer would find 7 
 \begin{insightbox}
 If the campaign had relied solely on crash-based fuzzing, it would have found 7 bugs (4 crashes + 3 arithmetic) and missed 9. If it had relied solely on code audit, it would have found 4 bugs and missed 12. The combination found all 16. The key multiplier was differential testing, which allowed the fuzzer to catch logic bugs that would otherwise require human reasoning to detect.
 \end{insightbox}
-
 
 \section{Lessons Learned}
 \label{sec:findings:lessons}
@@ -532,7 +525,6 @@ The coverage-guided workflow was iterative: (1)~run existing fuzz targets and ge
 
 The campaign ran over approximately two weeks of part-time effort. The breakdown: roughly 40\% of time was spent understanding the codebase and writing fuzz targets, 20\% running the fuzzer and triaging crashes, 20\% writing bug reports and suggested fixes, and 20\% on infrastructure (coverage scripts, input filtering, ASAN workarounds). The highest return-on-investment targets were the differential fuzzers---the triple indexer differential and the streaming/oneshot differential---which found the most impactful bugs (routing score errors, data loss) with relatively simple oracles.
 
-
 \section{Summary}
 
 Table~\ref{tab:bug-summary} provides a compact view of the campaign's results by component and discovery method.
@@ -565,13 +557,13 @@ Tokens     & 0 & 0 & 0 \\
   \item \textbf{Remaining blind spots}: the Harmony parser (async architecture), DeepSeek V3/V3.1 specific paths, and time-dependent scheduling logic remain at 0\% coverage and represent the highest-priority targets for future fuzzing investment.
 \end{itemize}
 
-\bigskip
+\medskip
 \begin{center}\rule{0.5\linewidth}{0.4pt}\end{center}
-\bigskip
+\medskip
 
 \noindent\textbf{Check Your Understanding}
 
-\medskip
+\smallskip
 \noindent\emph{These questions require reasoning about the findings and methodology.}
 
 \begin{enumerate}

@@ -3,7 +3,6 @@
 
 When a request arrives at Dynamo's router, it must answer a deceptively simple question: \emph{which GPU should handle this request?} A naive round-robin or least-loaded strategy ignores the most valuable information available---which GPU already has relevant KV cache blocks in memory. Routing a request to a GPU that has already cached 90\% of the prompt's KV data saves the compute cost of prefill for those tokens, reduces time to first token, and avoids wasting memory on duplicate cache entries. This chapter explains how Dynamo makes this decision, building from the foundational data structure (the radix tree) through the hashing scheme, cost function, and concurrency strategy.
 
-
 \section{The Routing Problem}
 \label{sec:kvrouter:problem}
 
@@ -33,7 +32,6 @@ A simpler design would hash the entire prompt and look up which worker last serv
 \end{whynotbox}
 
 Dynamo resolves the tension between cache affinity and load balancing through a \emph{cost function} that combines cache overlap with load metrics into a single scalar score per worker. The router evaluates this function for every candidate worker and selects the one with the best score. The configurable weight between these two factors is the \texttt{overlap\_score\_weight} parameter in \texttt{KvRouterConfig}, which defaults to \texttt{1.0}. Setting it to zero disables cache-aware routing entirely, reducing the router to a pure load balancer.
-
 
 \section{Tries and Radix Trees}
 \label{sec:kvrouter:trie}
@@ -137,7 +135,6 @@ The \texttt{lookup} table provides $O(1)$ access to any block by worker and sequ
 \begin{notebox}
 The \texttt{lookup} table serves a dual purpose: it enables $O(1)$ block access for event processing, and it provides tree size information per worker. The \texttt{tree\_sizes} field in \texttt{OverlapScores} is populated from \texttt{lookup.get(worker).len()}, giving the router a signal about how much data each worker has cached overall---used as a tie-breaker when multiple workers have identical overlap scores.
 \end{notebox}
-
 
 \section{Block Hashing}
 \label{sec:kvrouter:hashing}
@@ -519,7 +516,6 @@ The \texttt{KvRouterConfig} struct centralizes all routing parameters. Beyond \t
 
 These parameters interact in subtle ways. For instance, \texttt{router\_assume\_kv\_reuse = true} with \texttt{overlap\_score\_weight = 0} wastes hash computation (computing hashes that are never used for scoring). The config validation catches some of these inconsistencies but not all---another area where fuzzing proved valuable by exercising unusual parameter combinations.
 
-
 \section{Summary}
 
 \begin{itemize}
@@ -532,16 +528,16 @@ These parameters interact in subtle ways. For instance, \texttt{router\_assume\_
   \item The \textbf{DefaultWorkerSelector} orchestrates the full routing decision, from overlap scores through softmax sampling to tree-size tie-breaking.
 \end{itemize}
 
-\bigskip
+\medskip
 \begin{center}\rule{0.5\linewidth}{0.4pt}\end{center}
-\bigskip
+\medskip
 
 The router works in terms of block hashes, but where do those hashes come from? The next chapter explains how raw token sequences are partitioned into blocks, hashed with positional information, and managed through a type-state lifecycle.
 
-\bigskip
+\medskip
 \noindent\textbf{Check Your Understanding}
 
-\medskip
+\smallskip
 \noindent\emph{These questions are answerable from this chapter alone.}
 
 \begin{enumerate}

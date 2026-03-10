@@ -3,7 +3,6 @@
 
 The previous chapters explained how Dynamo works. This chapter explains how we broke it. \emph{Fuzzing} is an automated testing technique that generates random or semi-random inputs and feeds them to a program, looking for crashes, hangs, or incorrect behavior. When applied systematically to Dynamo's Rust libraries, it found 16 bugs across 36 fuzz targets in approximately 141 million test executions. This chapter explains what fuzzing is, how coverage-guided fuzzing works, why the oracle problem is the central challenge, and how we designed and executed the campaign.
 
-
 \section{What Is Fuzzing?}
 \label{sec:fuzzing:what}
 
@@ -28,7 +27,6 @@ Fuzzing Rust code differs from fuzzing C/C++ in a fundamental way. In C, the pri
 \begin{whynotbox}{Why not use property-based testing instead of fuzzing?}
 Property-based testing (PBT) frameworks like QuickCheck and proptest also generate random inputs and check assertions. The key difference is \emph{feedback}. PBT generates inputs from a distribution defined by the programmer---it has no visibility into which code paths a given input exercises. Coverage-guided fuzzing uses runtime instrumentation to \emph{observe} which branches each input takes, then preferentially mutates inputs that reach new code. This means fuzzing can discover deep, multi-step code paths that PBT's distribution would almost never produce. PBT is better when you have strong domain knowledge about the input distribution and want to verify specific properties. Fuzzing is better when you want to explore the full input space, including edge cases you did not anticipate. In practice, the two techniques are complementary: we used \texttt{Arbitrary} (a PBT-style input generator) \emph{inside} the coverage-guided fuzzing loop, getting the best of both.
 \end{whynotbox}
-
 
 \section{Coverage-Guided Fuzzing}
 \label{sec:fuzzing:coverage}
@@ -89,7 +87,6 @@ A concrete example from our campaign illustrates the power of this approach. The
 
 No human tester would write a unit test with \texttt{header\_len = 0xFFFFFFFFFFFFFFFF}. The fuzzer discovered it because coverage feedback rewarded inputs that passed the length check, and random mutation eventually produced extreme field values. This is the core value proposition of coverage-guided fuzzing: it systematically explores the space of inputs that reach deep code paths, including corner cases that humans overlook.
 
-
 \section{The Oracle Problem}
 \label{sec:fuzzing:oracle}
 
@@ -132,7 +129,6 @@ match selector.select_worker(&workers, &request, block_size) {
 \begin{notebox}
 The oracle problem explains why 4 of the 16 bugs were found by code audit rather than fuzzing. Logic bugs like ``parser drops text after the second tool call'' produce output that differs from the correct result, but the fuzzer has no way to know what the correct result is unless we encode the expectation as a property or differential test. The code auditor, reading the specification and the code side by side, can spot the discrepancy directly.
 \end{notebox}
-
 
 \section{Structuring Inputs with Arbitrary}
 \label{sec:fuzzing:arbitrary}
@@ -216,7 +212,6 @@ The fuzzer generates a sequence of \texttt{Store}, \texttt{Remove}, \texttt{Clea
 Structured fuzzing with \texttt{Arbitrary} is the bridge between the fuzzer's raw byte manipulation and the target's typed input expectations. It turns the fuzzer from a ``random byte cannon'' into a ``random \emph{valid input} cannon''---dramatically increasing the fraction of generated inputs that exercise meaningful code paths rather than being rejected at the parsing boundary.
 \end{insightbox}
 
-
 \section{Differential Testing}
 \label{sec:fuzzing:differential}
 
@@ -291,7 +286,6 @@ let blocks2 = create_stored_blocks(kv_block_size, &token_ids,
 assert_eq!(blocks.len(), blocks2.len(),
     "create_stored_blocks not deterministic");
 \end{lstlisting}
-
 
 \section{Campaign Design}
 \label{sec:fuzzing:design}
@@ -392,7 +386,6 @@ assert_eq!(dec_data, body, "data mismatch");
 
 This tests not just that the codec does not crash, but that it preserves data integrity---a property oracle that catches silent corruption bugs that a pure crash oracle would miss.
 
-
 \section{Infrastructure}
 \label{sec:fuzzing:infra}
 
@@ -488,7 +481,6 @@ Each crash was triaged by: (1) reproducing it, (2) reading the panic message and
 \textbf{TwoPartCodec Integer Overflow.} The decoder reads \texttt{header\_len} and \texttt{body\_len} as \texttt{u64}, then computes \texttt{24 + header\_len + body\_len} without checked arithmetic. When both lengths are near \texttt{u64::MAX}, the addition overflows and panics---a denial-of-service vector exploitable by sending 24 bytes of crafted data to any network-facing service using this codec. The \texttt{max\_message\_size} safety check occurs \emph{after} the overflow, so it cannot prevent the crash. Fix: use \texttt{checked\_add}. Found by \texttt{fuzz\_codec\_crash\_oracle}.
 \end{bugbox}
 
-
 \section{Summary}
 
 \begin{itemize}
@@ -501,16 +493,16 @@ Each crash was triaged by: (1) reproducing it, (2) reading the panic message and
   \item \textbf{Infrastructure details matter}: ASAN overrides \texttt{catch\_unwind}, requiring known-bug filtering instead of exception catching. Coverage reports reveal blind spots that guide target design.
 \end{itemize}
 
-\bigskip
+\medskip
 \begin{center}\rule{0.5\linewidth}{0.4pt}\end{center}
-\bigskip
+\medskip
 
 The methodology is established. The next chapter catalogs the results: what we found, why it matters, and what it teaches about the strengths and limitations of different testing approaches.
 
-\bigskip
+\medskip
 \noindent\textbf{Check Your Understanding}
 
-\medskip
+\smallskip
 \noindent\emph{These questions are answerable from this chapter alone.}
 
 \begin{enumerate}

@@ -9,11 +9,9 @@ Large language models predict the next word. Everything else---the distributed s
 
 This chapter explains what happens inside the model when it makes that prediction. We will build the transformer architecture from scratch, starting with how text becomes numbers and ending with the two computational phases---\emph{prefill} and \emph{decode}---that dominate every design decision in the rest of this guide. By the end, you will understand not just \emph{what} a transformer computes, but \emph{why} inference is hard, and where the bottlenecks lie.
 
-
 \section{Tokens and Embeddings}
 
 A neural network cannot operate on raw text. Before a model sees your prompt, every character sequence must be converted into numbers. This conversion happens in two steps: \emph{tokenization} and \emph{embedding lookup}.
-
 
 \subsection{Tokenization}
 
@@ -28,7 +26,6 @@ where $s$ is the input string and $n$ is the number of tokens produced. For exam
 
 The tokenizer is entirely separate from the neural network. It is a deterministic, rule-based preprocessing step---often using algorithms like Byte Pair Encoding (BPE)---that runs before the model sees any input, and again after the model produces output token IDs that need to be converted back to text.
 
-
 \subsection{The Embedding Lookup}
 
 Once we have token IDs $[t_1, \ldots, t_n]$, we need to convert each integer into something the neural network can process: a vector of floating-point numbers. This is done through an \emph{embedding table}\footnote{\textbf{Embedding}: a dense vector of floating-point numbers representing a token, learned during training.}---a large matrix $\mathbf{E} \in \mathbb{R}^{V \times d}$, where $V$ is the vocabulary size (as defined above) and $d$ is the \emph{model dimension} (often written $d_{\text{model}}$).
@@ -40,7 +37,6 @@ where $\mathbf{E}[\cdot]$ denotes selecting the row of the embedding matrix inde
 \begin{insightbox}
 The embedding vectors are \emph{learned} during training, not designed by hand. The model discovers, through billions of training examples, that certain directions in this high-dimensional space correspond to semantic relationships. The vector for ``king'' minus the vector for ``man'' plus the vector for ``woman'' is close to the vector for ``queen.'' We do not need to understand \emph{why} this works to build an inference system---we just need to know that after embedding lookup, each token is a dense vector ready for the transformer layers.
 \end{insightbox}
-
 
 \subsection{Adding Positional Information}
 
@@ -72,7 +68,6 @@ After this step, a prompt of $n$ tokens becomes the matrix that enters the first
 \begin{equation}
 \mathbf{X} = \begin{bmatrix} \mathbf{x}_1 \\ \mathbf{x}_2 \\ \vdots \\ \mathbf{x}_n \end{bmatrix} \in \mathbb{R}^{n \times d}
 \end{equation}
-
 
 \subsection{The Complete Input Pipeline}
 
@@ -125,12 +120,10 @@ Every formula in the rest of this chapter operates on $\mathbf{X}$ or on quantit
 \label{fig:input-pipeline}
 \end{figure}
 
-
 \section{The Attention Mechanism}
 \label{sec:attention-mechanism}
 
 The input matrix $\mathbf{X}$ tells us what each token \emph{is} and where it appears, but it says nothing about how tokens relate to each other. In the sentence ``The cat sat on the mat because \emph{it} was tired,'' the word ``it'' refers to ``cat''---but a bag of independent embedding vectors has no way to express that. The \emph{attention mechanism} is how the transformer lets every token look at every other token and decide which ones are relevant.
-
 
 \subsection{The Library Analogy}
 
@@ -145,7 +138,6 @@ Attention works exactly this way:
   \item $\mathbf{V}$ \textbf{(Value)} = the book's content. Each token generates a value vector that represents ``here is my information.''
 \end{itemize}
 Comparing a query against all keys tells us \emph{where to look}. Reading from the corresponding values tells us \emph{what to gather}. The output for each token is a weighted combination of all the value vectors, where the weights come from query-key comparisons.
-
 
 \subsection{From Analogy to Math}
 
@@ -375,7 +367,6 @@ When key block $j$ arrives with new scores, the maximum may increase ($m^{(j)} \
 That said, models are trained with a fixed maximum context length (e.g., 8K for the original LLaMA, 128K for newer models). Beyond this length, attention patterns degrade because the positional encodings were never seen at those distances during training. Techniques like RoPE scaling partially address this by interpolating or extrapolating the learned frequencies, but some quality loss at extreme lengths remains an active research problem.
 \end{notebox}
 
-
 \subsection{Why Three Separate Projections?}
 
 In Section~2.2.2, we introduced $\mathbf{W}^Q$, $\mathbf{W}^K$, and $\mathbf{W}^V$ as projection matrices that produce queries, keys, and values. But why project at all? Why not compare the raw embeddings $\mathbf{x}_i$ directly---compute $\mathbf{x}_i \cdot \mathbf{x}_j$ as the attention score, and use $\mathbf{x}_j$ itself as the value? Three independent reasons make this insufficient.
@@ -539,7 +530,6 @@ Practical approaches bring this down:
 The diminishing returns are severe. Each additional degree adds a projection matrix ($d \times d_k$ parameters), increases the constant factor in compute, and---crucially---still passes through the same softmax bottleneck. A degree-8 scoring function that produces exquisitely nuanced scores is still crushed into a single probability distribution that sums to 1. The marginal expressiveness gain from degree $k$ to $k + 1$ shrinks rapidly, while the marginal cost does not. In practice, even degree-3 (trilinear) has not displaced degree-2 (bilinear) as the default.
 \end{whynotbox}
 
-
 \section{Multi-Head Attention}
 \label{sec:multihead}
 
@@ -597,7 +587,6 @@ Think of it this way: each head is a different ``expert'' looking at the same da
 \begin{insightbox}
 Multi-head attention has essentially the same FLOP count as a single head with dimension $d_{\text{model}}$. To see why, compare the two costliest operations---computing $\mathbf{Q}\mathbf{K}^\top$ and $\boldsymbol{\alpha}\mathbf{V}$:
 
-\medskip
 \begin{center}
 \begin{tabular}{lll}
 \toprule
@@ -609,7 +598,6 @@ $\times$ number of heads & $\times\; 1$ & $\times\; h$ \\
 \bottomrule
 \end{tabular}
 \end{center}
-\medskip
 
 The same cancellation applies to $\boldsymbol{\alpha}\mathbf{V}$. The Q/K/V projections also have identical total cost: $h$ matrices of size $d_{\text{model}} \times d_k$ is the same parameter count as one matrix of size $d_{\text{model}} \times d_{\text{model}}$. The only additional cost is the output projection $\mathbf{W}^O$ ($n \cdot d_{\text{model}}^2$ FLOPs), which is modest relative to the attention computation for long sequences. The benefit of multi-head is not more compute---it is \emph{richer representations}: $h$ independent attention patterns instead of one.
 \end{insightbox}
@@ -622,7 +610,6 @@ The same cancellation applies to $\boldsymbol{\alpha}\mathbf{V}$. The Q/K/V proj
 \label{sec:transformer-block}
 
 Multi-head attention alone is not enough to build a powerful model. Attention is good at mixing information \emph{across} token positions (``let token 5 look at token 2''), but the aggregation step---once attention weights are fixed---is a weighted sum of value vectors with no pointwise nonlinearity---it cannot introduce nonlinear transformations that detect complex patterns. A transformer block combines attention with a \emph{feed-forward network} and two critical architectural features: \emph{residual connections} and \emph{layer normalization}.
-
 
 \subsection{The Residual Stream}
 \label{sec:residual-stream}
@@ -641,7 +628,6 @@ This is remarkably important. It means each sub-layer does not need to represent
 
 For inference, this also means that the residual stream must be maintained in memory for every token, at every layer boundary. As we will see in Chapter~\ref{ch:kvcache}, this memory cost adds up fast.
 
-
 \subsection{Layer Normalization}
 \label{sec:layernorm}
 
@@ -657,7 +643,6 @@ In plain terms: center the vector around zero, scale it to unit variance, then l
 
 \paragraph{Why LayerNorm and not BatchNorm?}
 Batch normalization\footnote{Sergey Ioffe and Christian Szegedy, ``Batch Normalization: Accelerating Deep Network Training by Reducing Internal Covariate Shift,'' \emph{ICML}, 2015.} normalizes across the \emph{batch dimension}: for each feature, it computes the mean and variance across all samples in the batch. This works well for fixed-size inputs in CNNs, but it fails for transformers in two ways. First, sequences have variable lengths---position 50 might exist in some sequences but not others, making the batch statistics at that position poorly defined. Second, during inference the batch size is often 1 (or very small), and batch statistics computed over a single sample are meaningless noise. LayerNorm avoids both problems by normalizing across the \emph{feature dimension} within a single token's vector: the mean and variance in Equation~\ref{eq:layernorm} are computed over the $d$ elements of one token, with no dependence on other tokens or other sequences in the batch. This makes LayerNorm equally stable whether the batch contains 1 sequence or 1,000.
-
 
 \subsection{The Feed-Forward Network}
 \label{sec:ffn}
@@ -703,7 +688,6 @@ Two widely adopted alternatives:
 \end{itemize}
 In all cases, the expand-then-contract structure is preserved: project up to a wider dimension, apply the nonlinearity, project back down to $d_{\text{model}}$.
 \end{notebox}
-
 
 \subsection{Putting It Together: One Transformer Block}
 \label{sec:one-block}
@@ -761,7 +745,6 @@ A single transformer block performs six operations in sequence:\footnote{The ori
 \label{fig:transformer-block}
 \end{figure}
 
-
 \section{Stacking Blocks into a Model}
 \label{sec:stacking}
 
@@ -818,7 +801,6 @@ A complete transformer language model stacks $L$ transformer blocks, each with t
 \label{fig:full-model}
 \end{figure}
 
-
 \subsection{The Decoder-Only Architecture}
 \label{sec:decoder-only}
 
@@ -848,7 +830,6 @@ In a decoder-only model, the input prompt and the generated output are treated a
 \textbf{Encoder-only models still exist.} BERT (Devlin et al., 2019) is an \emph{encoder-only} transformer: bidirectional attention, no causal mask, no autoregressive generation. It is designed for tasks that require understanding a complete input (classification, named entity recognition, question answering) rather than generating new text. Encoder-decoder models also survive in niches like T5 (Raffel et al., 2020) and machine translation. But for open-ended text generation---the task that defines modern LLMs---decoder-only has become the dominant architecture.
 \end{notebox}
 
-
 \subsection{From Hidden States to Token Predictions}
 \label{sec:unembedding}
 
@@ -875,7 +856,6 @@ P(\text{token}_j \mid \text{context}) = \frac{e^{z_j}}{\sum_{\ell=1}^{V} e^{z_\e
 where the denominator sums over all $V$ tokens in the vocabulary, ensuring the probabilities sum to one.
 
 The model's prediction is this probability distribution. The next step---actually choosing a token---is the subject of the next section.
-
 
 \subsection{A Single Forward Pass (Before Generation)}
 \label{sec:forward-pass}
@@ -910,7 +890,6 @@ P(\text{token}_j) = \frac{e^{z_j}}{\sum_{\ell=1}^{V} e^{z_\ell}} \qquad (\text{l
 
 Each layer $\ell$ has its own learned parameters ($\mathbf{W}_i^{Q(\ell)}, \mathbf{W}_i^{K(\ell)}, \mathbf{W}_i^{V(\ell)}, \mathbf{W}^{O(\ell)}, \mathbf{W}_1^{(\ell)}, \mathbf{W}_2^{(\ell)}$, and layer norm parameters), all independently trained. The four lines in the middle are exactly the transformer block from Figure~\ref{fig:transformer-block}: layer norm, attention, residual add, layer norm, FFN, residual add. We use $\mathbf{x}_n^{(L)}$---the last token's row of $\mathbf{X}^{(L)}$---because, as explained in Section~\ref{sec:unembedding}, only the last position has attended to the entire input.
 
-
 \section{Autoregressive Generation}
 \label{sec:autoregressive}
 
@@ -941,7 +920,6 @@ A language model does not produce a complete response in one shot. It generates 
 
 \marginnote{\emph{EOS}: End-Of-Sequence, a special token that signals generation is complete.}%
 \paragraph{The EOS token.} The stopping condition in line 6 of Algorithm~\ref{alg:autoregressive} deserves explanation. Every tokenizer includes a special \emph{end-of-sequence} (EOS) token in its vocabulary---a token that never appears in normal text. During training, the model learns that EOS marks the natural end of a response. When the model generates EOS during inference, the system stops decoding immediately: the response is complete. Without EOS, the model would generate text up to the maximum token limit, often producing incoherent trailing output. In practice, chat models use format-specific stop tokens (e.g., \texttt{<|im\_end|>} for ChatML, \texttt{</s>} for LLaMA) that serve the same purpose.
-
 
 \subsection{Sampling and Temperature}
 \label{sec:sampling}
@@ -1038,12 +1016,10 @@ When $\tau = 1$, the distribution is unchanged. When $\tau < 1$ (e.g., 0.3), the
 From an inference system's perspective, the \emph{sampling strategy does not affect the computational cost}. Whether the system uses greedy decoding or top-$p$ sampling, the model must still compute the full probability distribution over the entire vocabulary for every single generated token. Sampling is a cheap post-processing step; the expensive part is the forward pass.
 \end{insightbox}
 
-
 \section{The Two Phases: Prefill and Decode}
 \label{sec:prefill-decode}
 
 We now arrive at the most important concept in this chapter for understanding inference systems. When a user sends a prompt and the model generates a response, the computation falls into two distinct phases with fundamentally different performance characteristics.
-
 
 \subsection{Prefill: Processing the Prompt}
 \label{sec:prefill}
@@ -1054,7 +1030,6 @@ The \emph{prefill} phase processes the entire input prompt in a single forward p
 During prefill, the core operations are \emph{matrix-matrix multiplications}: the $n \times d$ input matrix is multiplied by the $d \times d_k$ projection matrices, the $n \times d_k$ query matrix is multiplied by the $n \times d_k$ key matrix (transposed), and so on. Each of these is a large, dense matrix multiplication.
 
 GPUs are extraordinary at matrix-matrix multiplication. The arithmetic intensity---the ratio of computation (floating-point operations) to memory access (bytes read)---is high. Multiplying an $n \times d$ matrix by a $d \times d_k$ projection matrix involves $O(n \cdot d \cdot d_k)$ floating-point operations but only requires reading $O(n \cdot d + d \cdot d_k)$ bytes. When $n$ is large (a long prompt), the GPU's compute units are fully utilized: every byte fetched from memory is reused many times. This makes prefill \textbf{compute-bound}---the GPU's arithmetic throughput (measured in TFLOPS) is the limiting factor.
-
 
 \subsection{Decode: Generating Tokens}
 \label{sec:decode}
@@ -1094,7 +1069,6 @@ For even more aggressive compression, \emph{quantization} reduces weights to INT
     \item \textbf{Prefill}: With a 1,000-token prompt, the same weight matrices are reused 1,000 times (once per token in the batch), so the arithmetic intensity is ${\sim}1{,}000\times$ higher. The GPU's 312 TFLOPS (A100 FP16) become the bottleneck instead of memory bandwidth.
 \end{itemize}
 
-
 \subsection{Why This Distinction Matters}
 \label{sec:why-prefill-decode}
 
@@ -1107,7 +1081,6 @@ The prefill/decode dichotomy drives nearly every architectural decision in a mod
 \end{enumerate}
 
 Every subsequent chapter in this guide is, in some sense, an answer to the question: \emph{given that decode is memory-bandwidth-bound and the KV cache is enormous, how do we serve LLMs efficiently?}
-
 
 \subsection{From Prompt to Response: The Full Inference Trace}
 \label{sec:inference-trace}
@@ -1227,7 +1200,6 @@ After 32 layers, the model extracts $\mathbf{x}_5^{(32)}$, projects to vocabular
 \label{fig:prefill-vs-decode}
 \end{figure}
 
-
 \section{Summary}
 \label{sec:ch2-summary}
 
@@ -1242,12 +1214,11 @@ We have built the transformer architecture from the ground up:
     \item \textbf{Prefill} processes the prompt in parallel and is \textbf{compute-bound}. \textbf{Decode} generates tokens one at a time and is \textbf{memory-bandwidth-bound}. This asymmetry drives the design of every inference serving system.
 \end{itemize}
 
-\bigskip
+\medskip
 \centerline{\rule{0.3\textwidth}{0.4pt}}
-\bigskip
+\medskip
 
 During the decode phase, each new token must attend to every previous token's key and value vectors. But those vectors don't change---recomputing them is pure waste. This observation leads to the single most important data structure in LLM serving.
-
 
 % ===========================================================================
 % Check Your Understanding
@@ -1281,7 +1252,6 @@ During the decode phase, each new token must attend to every previous token's ke
 
     \item Consider the full inference pipeline: tokenization $\to$ embedding $\to$ $L$ transformer blocks $\to$ unembedding $\to$ softmax $\to$ sampling. Every component except the sampler is deterministic. Yet LLMs produce different responses to the same prompt. Where exactly does randomness enter the system, and why is this randomness \emph{necessary} rather than merely convenient? What would happen to long-form generation if you always picked the highest-probability token?
 \end{enumerate}
-
 
 \subsection*{Answers}
 

@@ -3,7 +3,6 @@
 
 A single GPU cannot serve a modern large language model alone. The model weights of a 70-billion-parameter model in FP16 occupy approximately 140\,GB---far exceeding the 80\,GB of even the largest commodity GPU (NVIDIA A100/H100). Even when the weights fit, the KV cache for a large batch of long sequences can consume tens of additional gigabytes, as Chapter~\ref{ch:kvcache} demonstrated. This chapter explains the techniques that distribute inference across multiple GPUs: tensor parallelism (splitting a single layer), pipeline parallelism (splitting across layers), continuous batching (maximizing GPU utilization), speculative decoding (generating multiple tokens per step), and disaggregated serving (separating prefill from decode).
 
-
 \section{The Single-GPU Bottleneck}
 \label{sec:distributed:bottleneck}
 
@@ -69,7 +68,6 @@ The decode phase of LLM inference is one of the most memory-bound workloads in m
 \end{insightbox}
 
 This memory bandwidth bottleneck means that making inference faster requires either reducing the amount of data read (quantization, smaller models) or reading from more memory buses simultaneously (distributing across GPUs). The latter approach is the subject of the remaining sections. We begin with the two fundamental strategies for splitting a model across GPUs: tensor parallelism (splitting within each layer) and pipeline parallelism (splitting across layers).
-
 
 \section{Tensor Parallelism}
 \label{sec:distributed:tensor}
@@ -345,7 +343,6 @@ Under continuous batching, each completed request's slot is immediately refilled
 \marginnote{Prefill-decode interference is a primary motivation for disaggregated serving (Section~\ref{sec:distributed:disaggregated}).}%
 There is a subtlety: when a new request enters the continuous batch, its prompt must be prefilled---a compute-intensive operation that processes all input tokens in parallel. This prefill computation shares the GPU with ongoing decode iterations for other requests. Because prefill has much higher arithmetic intensity than decode, it can delay the decode iterations, causing latency spikes for in-flight requests. This \emph{prefill-decode interference} is one of the key challenges of continuous batching, and a major motivation for disaggregated serving (Section~\ref{sec:distributed:disaggregated}).
 
-
 \section{Speculative Decoding}
 \label{sec:distributed:speculative}
 
@@ -488,7 +485,6 @@ The power of disaggregation becomes clear when workload characteristics vary. Co
 
 With co-located serving, both scenarios require the same number of GPUs (scaled to the dominant phase), wasting resources on the non-dominant phase. With disaggregated serving, the prefill and decode pools scale independently, potentially halving GPU costs for skewed workloads. Dynamo's planner component monitors active prefill tokens and active decode blocks on each worker, dynamically scaling each pool based on current demand.
 
-
 \section{Putting It All Together}
 \label{sec:distributed:together}
 
@@ -504,7 +500,6 @@ These five techniques are not mutually exclusive---they compose. A production de
 
 The total GPU count in this configuration is $8 \times 4 = 32$ GPUs per model replica, with additional GPUs in the disaggregated decode pool. The system collectively provides $32 \times 3.35 = 107$\,TB/s of aggregate HBM bandwidth (H100), enabling decode throughput orders of magnitude beyond what a single GPU can achieve.
 
-
 \section{Summary}
 
 \begin{itemize}
@@ -516,16 +511,16 @@ The total GPU count in this configuration is $8 \times 4 = 32$ GPUs per model re
   \item \textbf{Disaggregated serving} separates compute-bound prefill from memory-bound decode, enabling independent scaling and eliminating cross-phase interference. Requires KV cache transfer over the network.
 \end{itemize}
 
-\bigskip
+\medskip
 \begin{center}\rule{0.5\linewidth}{0.4pt}\end{center}
-\bigskip
+\medskip
 
 We now have the conceptual tools to understand every major component of Dynamo. The next chapter traces a request end-to-end through the system, showing how these distributed inference techniques are composed into a working architecture.
 
-\bigskip
+\medskip
 \noindent\textbf{Check Your Understanding}
 
-\medskip
+\smallskip
 \noindent\emph{These questions are answerable from this chapter alone.}
 
 \begin{enumerate}

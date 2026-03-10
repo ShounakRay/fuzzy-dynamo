@@ -6,7 +6,6 @@ You type a message into a chat interface and press \emph{Send}. An HTTP request 
 
 Every italicized term above is a promise. Over the next nine chapters, we will explain each one from scratch, building from the linear algebra inside a single GPU all the way out to the distributed system that orchestrates hundreds of them.
 
-
 \section{What Dynamo Is}
 
 NVIDIA Dynamo is an open-source, distributed inference-serving framework designed to orchestrate large language model (LLM) inference across multi-node GPU clusters. Built primarily in Rust, with Go for deployment infrastructure (Kubernetes operator, API server), and Python for extensibility, it represents a new class of infrastructure software: \emph{AI serving infrastructure}---systems that sit between users and AI models, managing GPU memory, network communication, and request routing to make real-time AI possible at scale.
@@ -18,7 +17,6 @@ Dynamo implements several techniques drawn from recent systems research:
   \item \textbf{Continuous batching}: Requests enter and exit the GPU's processing batch at the granularity of individual iterations rather than waiting for a full batch to complete.
   \item \textbf{Custom binary protocols}: A zero-copy TCP codec handles all inter-service communication with a 24-byte fixed preamble followed by variable-length header and body payloads.
 \end{itemize}
-
 
 \section{The Language: Why Rust}
 
@@ -42,7 +40,6 @@ Three properties make Rust particularly well-suited to inference infrastructure:
 Rust's adoption in performance-critical infrastructure is well-established. AWS Firecracker (which powers Lambda) is written in Rust and starts microVMs in under 125\,ms. Cloudflare's Pingora, a Rust rewrite of their NGINX-based proxy, serves over a trillion requests daily with 70\% less CPU and 67\% less memory than the NGINX-based system it replaced. In the AI ecosystem specifically, Hugging Face Tokenizers (Rust core, Python bindings) achieves a 43$\times$ speedup over its pure-Python predecessor.
 \end{notebox}
 
-
 \subsection{Rust Concepts for This Guide}
 
 The remaining chapters reference several Rust-specific concepts. We introduce them briefly here; each will be revisited in context when it appears.
@@ -57,7 +54,6 @@ The remaining chapters reference several Rust-specific concepts. We introduce th
 
 \textbf{Traits.}\hspace{1em} Rust's mechanism for polymorphism. A trait defines a set of methods that types must implement---similar to interfaces in other languages. Dynamo's reasoning parsers all implement a single \texttt{ReasoningParser} trait (Chapter~\ref{ch:codecs}), allowing the system to dispatch to any of eleven parser variants through a uniform interface.
 
-
 \subsection{What Rust Does and Does Not Prevent}
 
 This distinction is fundamental to the fuzzing campaign in Chapters~\ref{ch:fuzzing}--\ref{ch:findings}:
@@ -68,14 +64,12 @@ This distinction is fundamental to the fuzzing campaign in Chapters~\ref{ch:fuzz
 
 There is one additional subtlety: \textbf{debug vs.\ release divergence}. Rust compiles with integer overflow checks in debug mode (overflow panics) and without them in release mode (overflow wraps silently via two's complement). The same code can crash in debug and produce silently wrong results in release. Bug~18---the critical integer overflow in the network codec (Chapter~\ref{ch:findings})---exploits exactly this divergence.
 
-
 \subsection{The Rust--Python Bridge}
 
 \marginnote{\emph{PyO3 generates Python extension modules from Rust code. The build tool Maturin compiles Rust into Python wheels.}}%
 Dynamo is not a pure Rust system. The GPU inference engines it orchestrates---vLLM, SGLang, TensorRT-LLM---are all Python-first. Model configuration, custom preprocessing, and operator-facing APIs are written in Python. The bridge between the two languages is \textbf{PyO3}, a Rust library that enables bidirectional function calls between Rust and Python with near-zero overhead.
 
 The architectural split is deliberate: Rust handles the \emph{hot path}---network I/O, binary protocol encoding/decoding, data structure operations, request routing---where microsecond latency matters. Python handles the \emph{configuration path}---model loading, inference engine integration, scaling policies---where flexibility matters more than raw speed. This pattern is increasingly common in AI infrastructure: Hugging Face Tokenizers (Rust core, Python API), Polars (Rust DataFrame library with Python bindings), and Pydantic v2 (Rust validation core, 4--50$\times$ faster than the pure-Python v1) all follow the same design.
-
 
 \section{Dynamo in Context: The Inference Runtime Landscape}
 
@@ -95,7 +89,6 @@ Think of the distinction this way: vLLM makes one model go fast. Dynamo makes a 
 
 This layered architecture is why Dynamo makes a compelling case study. Its codebase encompasses problems from every level of the stack: low-level binary codecs for inter-service communication, data structures for distributed cache indexing, parsers for extracting structured content from model output, and orchestration logic for routing and scaling. Fuzzing it stress-tests not just one system, but an entire category of infrastructure.
 
-
 \section{Why This Guide Exists}
 
 This guide has two goals. The first is \textbf{pedagogical}: to teach distributed LLM inference from first principles, using Dynamo as a concrete case study. We assume you know how to program and recall basic linear algebra (matrix multiplication), but nothing about transformers, attention, or GPU architecture. Every concept is explained before it is used. If you read this document linearly from Chapter~\ref{ch:transformer} through Chapter~\ref{ch:codecs}, you will understand how a modern LLM serving system works---not just what the components are, but \emph{why} they exist and \emph{how} they compose.
@@ -106,7 +99,6 @@ The second goal is \textbf{empirical}: to stress-test the system. We subjected D
   \item \textbf{9 medium severity}: Silent data corruption in LLM output parsers (tool call arguments dropped, strings corrupted, streaming mismatches), arithmetic panics on edge-case inputs, and stale caches.
 \end{itemize}
 Of the 16 bugs, 12 were found by fuzzing and 4 by code audit. Two bugs (the TwoPartCodec overflow and the RadixTree score underreporting) were independently fixed upstream before our disclosure. No prior fuzzing infrastructure existed in the Dynamo repository.
-
 
 \section{How to Read This Guide}
 
@@ -135,7 +127,6 @@ The guide is structured as a narrative that builds progressively. Each chapter a
 
 Chapters~\ref{ch:transformer}--\ref{ch:codecs} form the architecture half of the guide ($\sim$70\%). Chapters~\ref{ch:fuzzing}--\ref{ch:findings} form the fuzzing half ($\sim$30\%). You can read the architecture chapters independently as a primer on distributed LLM inference. The fuzzing chapters reference the architecture to explain \emph{what} we tested and \emph{why} specific bugs matter.
 
-
 \section{Notation and Conventions}
 
 Throughout this guide, we use the following conventions:
@@ -149,7 +140,6 @@ Throughout this guide, we use the following conventions:
   \item \textbf{Cross-references} use the format ``Chapter X'' or ``Section X.Y'' and are hyperlinked in the PDF.
 \end{itemize}
 
-
 \section{Summary}
 
 This chapter established the context for the rest of the guide:
@@ -160,17 +150,16 @@ This chapter established the context for the rest of the guide:
   \item \textbf{Two goals} drive this guide: pedagogical (teach distributed LLM inference from first principles using Dynamo as a case study) and empirical (stress-test the system with a systematic fuzzing campaign that found 16 bugs).
 \end{itemize}
 
-\bigskip
+\medskip
 \begin{center}\rule{0.5\linewidth}{0.4pt}\end{center}
-\bigskip
+\medskip
 
 Before we can understand any of this machinery, we need to understand what happens inside a single GPU when a model generates a single token.
 
-
-\bigskip
+\medskip
 \noindent\textbf{Check Your Understanding}
 
-\medskip
+\smallskip
 \noindent\emph{These questions start with recall and progress to conceptual reasoning. All are answerable from this chapter alone.}
 
 \begin{enumerate}
@@ -184,7 +173,7 @@ Before we can understand any of this machinery, we need to understand what happe
   \item The chapter lists the bugs found: 5 by fuzzer only, 10 by code audit only, 3 by both. If Rust already eliminates the traditional targets of fuzzing (buffer overflows, use-after-free), why does fuzzing still find bugs that code audit misses---and vice versa? What is it about each method that gives it access to a different class of bug?
 \end{enumerate}
 
-\bigskip
+\medskip
 \noindent\textbf{Answers}
 
 \begin{enumerate}
