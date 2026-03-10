@@ -1,0 +1,609 @@
+\chapter{Findings and Lessons}
+\label{ch:findings}
+
+This is the payoff chapter. The previous chapters built the infrastructure---fuzz targets, oracles, structured input generators, coverage measurement. This chapter presents what that infrastructure found: 16 bugs spanning crash vulnerabilities, silent logic errors, arithmetic edge cases, and concurrency hazards. For each bug, we describe the root cause, the triggering condition, the impact, and what it teaches about the system. The chapter concludes with a comparative analysis of fuzzing versus code audit and the methodology lessons that generalize beyond Dynamo.
+
+Some of these bugs are embarrassing---a division by zero where the divisor comes from configuration, a string slice at a non-character boundary. Others are subtle---a tree traversal that miscounts matched blocks, a streaming parser that silently drops the first token. Together, they paint a picture of a codebase that is memory-safe (thanks to Rust) but far from bug-free, and of a testing methodology where fuzzing and human reasoning each catch different classes of defect.
+
+
+\section{Bug Census}
+\label{sec:findings:census}
+
+\marginnote{\emph{Bug census:} a systematic inventory of all defects found, classified by severity, type, and discovery method.}%
+The campaign found 16 distinct bugs across four components of the Dynamo codebase. Table~\ref{tab:bug-census} provides the complete inventory. Two of the 16 bugs have already been fixed upstream: the TwoPartCodec integer overflow (PR~\#6959) and the RadixTree score underreporting (PRs~\#5973 and \#6122).
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{clllll}
+\toprule
+\textbf{\#} & \textbf{Bug} & \textbf{Severity} & \textbf{Type} & \textbf{Component} & \textbf{Found by} \\
+\midrule
+1  & GLM-4.7 UTF-8 boundary panic       & High   & Crash      & Parsers    & Fuzzer \\
+2  & ConcurrentRadixTree deadlock        & High   & Crash      & KV-Router  & Fuzzer \\
+3  & TwoPartCodec integer overflow       & High   & Crash      & Runtime    & Fuzzer \\
+4  & Stored blocks OOB access            & High   & Crash      & KV-Router  & Fuzzer \\
+5  & Positional indexer jump-skip        & High   & Logic      & KV-Router  & Fuzzer \\
+6  & RadixTree score underreporting      & High   & Logic      & KV-Router  & Fuzzer \\
+7  & Pythonic prefix leak                & High   & Logic      & Parsers    & Fuzzer \\
+8  & Granite streaming mismatch          & Medium & Logic      & Parsers    & Fuzzer \\
+9  & MiniMax streaming mismatch          & Medium & Logic      & Parsers    & Fuzzer \\
+10 & DSML parameter dropping             & Medium & Logic      & Parsers    & Audit \\
+11 & KimiK2 OnceLock caching             & Medium & Logic      & Parsers    & Audit \\
+12 & XML try\_literal\_eval corruption   & Medium & Logic      & Parsers    & Audit \\
+13 & XML strip\_quotes panic             & Medium & Panic      & Parsers    & Audit \\
+14 & Worker selector div-by-zero         & Medium & Arithmetic & KV-Router  & Fuzzer \\
+15 & Block hash div-by-zero              & Medium & Arithmetic & KV-Router  & Fuzzer \\
+16 & Request extra info div-by-zero      & Medium & Arithmetic & KV-Router  & Fuzzer \\
+\bottomrule
+\end{tabular}
+\caption{Complete bug census. ``Found by'' indicates the primary discovery method.}
+\label{tab:bug-census}
+\end{table}
+
+The distribution by component is revealing. Parsers account for 8 of 16 bugs---half---despite comprising a modest fraction of the codebase. The KV-Router contributes 7 bugs, and the Runtime codec contributes 1. No bugs were found in the Tokens library, which has simpler logic and fewer code paths.
+
+\begin{center}
+\begin{tabular}{lr@{\hspace{2em}}lr}
+\toprule
+\textbf{By severity} & \textbf{Count} & \textbf{By type} & \textbf{Count} \\
+\midrule
+High   & 7  & Crash      & 4 \\
+Medium & 9  & Logic      & 8 \\
+       &    & Arithmetic & 3 \\
+       &    & Panic      & 1 \\
+\midrule
+\textbf{Total} & \textbf{16} & \textbf{Total} & \textbf{16} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insightbox}
+The parser zoo---Dynamo's collection of model-specific output parsers---is the single richest source of bugs. Each parser implements bespoke string manipulation logic for a different model family, often using regular expressions, byte-level slicing, and ad hoc state machines. The lack of a shared parsing framework means each parser independently re-introduces the same classes of error: byte/character confusion, missing boundary checks, and inconsistent streaming behavior.
+\end{insightbox}
+
+\begin{whynotbox}{Why not just fix the bugs?}
+A natural question: if you found 16 bugs, why document them instead of submitting patches? Three reasons make documentation the higher-value first step. First, the correct fix often requires design decisions that only the maintainers can make. The KimiK2 \texttt{OnceLock} bug (Bug~\#11) could be fixed by removing caching entirely, by keying on configuration tokens, or by restructuring how parsers are instantiated---each has different performance and API implications. A bug report with root cause analysis lets the maintainers choose; a patch forces a particular design. Second, some bugs interact with other bugs. The three division-by-zero bugs (\#14--\#16) share a root cause (unvalidated \texttt{kv\_block\_size}), so the right fix is a single validation at the configuration boundary, not three separate guards. Documentation of the full set makes this pattern visible. Third, bug reports have pedagogical value that patches lack. A report explaining \emph{why} \texttt{trim().len()} is not a valid byte index (Bug~\#1) teaches a pattern that prevents an entire class of future bugs. A one-line patch teaches nothing. Two bugs \emph{were} fixed upstream during the campaign (Bugs~\#3 and \#6), demonstrating that good documentation naturally leads to fixes.
+\end{whynotbox}
+
+
+\section{Crash Bugs}
+\label{sec:findings:crashes}
+
+Crash bugs cause the program to panic, terminating the thread or the entire service. In a production inference server, a crash in the codec, router, or parser kills the request handler and may cascade to other in-flight requests sharing the same thread pool. In Dynamo's architecture, where a single router process handles KV cache events from all GPU workers, a panic in the router is a single point of failure that affects every in-flight request.
+
+We found four HIGH-severity crash bugs and one MEDIUM panic. Each crash is trivially exploitable for denial of service: an attacker (or a buggy GPU worker) needs only send a single crafted message to bring down the affected component.
+
+\subsection{GLM-4.7 UTF-8 Boundary Panic}
+
+\begin{bugbox}
+\textbf{Bug \#1: GLM-4.7 UTF-8 boundary panic} \hfill \textsc{High} / Crash / Parsers
+
+The GLM-4.7 tool call parser panics with ``byte index is not a char boundary'' when the content between \texttt{<tool\_call>} tags has leading whitespace and the function name contains multibyte UTF-8 characters (CJK, Cyrillic, emoji).
+
+\medskip
+\textbf{Root cause} (\texttt{glm47\_parser.rs:203--216}):
+\begin{verbatim}
+let function_name = content[..pos].trim().to_string();
+// ...
+let args_section = &content[function_name.len()..];
+\end{verbatim}
+
+The code extracts a function name by trimming whitespace, then uses the \emph{trimmed} string's byte length as an index into the \emph{untrimmed} content. When trim removes leading spaces, \texttt{function\_name.len()} points into the middle of a multibyte character in the original string.
+
+\medskip
+\textbf{Example}: Content is \texttt{"~~.{\"u0448}..."} (2 leading spaces, then a dot, then the Cyrillic \texttt{sh} character at bytes 3--4). After trim, \texttt{function\_name} is \texttt{".{\"u0448}"} (4 bytes). Indexing \texttt{content[4..]} lands inside the 2-byte Cyrillic character---panic.
+\end{bugbox}
+
+\marginnote{\emph{Byte vs.\ char boundary:} Rust strings are UTF-8 encoded. Indexing at a byte offset that falls within a multi-byte character is a runtime panic, not undefined behavior.}%
+This bug illustrates a pervasive hazard in Rust string processing: \emph{byte-level operations on character-level results}. The \texttt{trim()} method operates on Unicode characters, removing leading and trailing whitespace measured in characters. But \texttt{len()} returns the byte count of the resulting string. When these two quantities are mixed---using the byte length of a trimmed string as an index into the original, untrimmed string---the index may land inside a multibyte character. Rust's string slicing checks char boundaries at runtime and panics if the index is invalid.
+
+The fundamental issue is that trimming changes the byte-to-character mapping. If the original string has $k$ bytes of leading whitespace and the first non-whitespace character is a 2-byte UTF-8 character, then the trimmed string starts with that character and \texttt{trimmed.len()} counts from byte 0 of the trimmed string. But using \texttt{trimmed.len()} as an index into the \emph{original} string points to position $\texttt{trimmed.len()}$, not $k + \texttt{trimmed.len()}$---and this position may be mid-character. The fix is to use the original byte position (\texttt{pos}) rather than the trimmed string's length:
+
+\begin{verbatim}
+let args_section = &content[pos..];  // pos from content.find(arg_key_start)
+\end{verbatim}
+
+\subsection{TwoPartCodec Integer Overflow}
+
+\begin{bugbox}
+\textbf{Bug \#3: TwoPartCodec integer overflow} \hfill \textsc{High} / Crash / Runtime
+
+\textbf{Status: FIXED upstream} (Issue \#6955, PR \#6959)
+
+\medskip
+The binary codec reads two \texttt{u64} values from the network---\texttt{header\_len} and \texttt{body\_len}---and computes total message size. The addition overflows before the \texttt{max\_message\_size} safety check.
+
+\medskip
+\textbf{Root cause} (\texttt{two\_part.rs:54--58}):
+\begin{verbatim}
+let header_len = cursor.get_u64() as usize;
+let body_len = cursor.get_u64() as usize;
+let _checksum = cursor.get_u64();
+let total_len = 24 + header_len + body_len;  // OVERFLOW
+\end{verbatim}
+
+An attacker sends 24 bytes where \texttt{header\_len = u64::MAX} and \texttt{body\_len = 1}. The sum wraps around, producing a small \texttt{total\_len} that passes the size check. In debug mode this panics; in release mode it silently wraps. See Section~\ref{sec:findings:divergence} for the security implications.
+\end{bugbox}
+
+The upstream fix used checked arithmetic: \texttt{24usize.checked\_add(header\_len).and\_then(|v| v.checked\_add(body\_len))}. This is the correct pattern---it returns an error instead of panicking or wrapping, and it runs before the size validation so the check always sees a valid value.
+
+\begin{notebox}
+The TwoPartCodec is Dynamo's most security-sensitive component: it processes every byte of every inter-service message. The codec sits at the network boundary, parsing data from TCP connections that may come from untrusted or compromised workers. Any bug in the codec is directly exploitable by anyone who can send bytes to the service. The integer overflow was exploitable with just 24 bytes of crafted input---no authentication, no valid session, no prior interaction required.
+\end{notebox}
+
+\subsection{Stored Blocks Out-of-Bounds Access}
+
+\begin{bugbox}
+\textbf{Bug \#4: stored\_blocks OOB access} \hfill \textsc{High} / Crash / KV-Router
+
+Two related panics in \texttt{zmq\_wire.rs} when \texttt{token\_ids} is shorter than the block count implies. A malformed worker event claims $N$ blocks but provides fewer than $N \times \texttt{kv\_block\_size}$ tokens.
+
+\medskip
+\textbf{Root cause 1} (\texttt{zmq\_wire.rs:479}):
+\begin{verbatim}
+let tokens = &token_ids[token_offset..(token_offset + *num_tokens)];
+\end{verbatim}
+No bounds check: panics with ``index out of bounds'' when \texttt{token\_ids} is too short.
+
+\medskip
+\textbf{Root cause 2} (\texttt{zmq\_wire.rs:431--436}):
+\begin{verbatim}
+compute_block_hash_for_seq(token_ids, kv_block_size, ...)[0]
+\end{verbatim}
+When \texttt{token\_ids.len() < kv\_block\_size}, \texttt{chunks\_exact} produces zero chunks, the function returns an empty \texttt{Vec}, and \texttt{[0]} panics.
+\end{bugbox}
+
+Both bugs are reachable through \texttt{convert\_event}, which processes ZMQ events from GPU workers. The \texttt{convert\_event} path constructs \texttt{num\_block\_tokens} as \texttt{vec![block\_size as u64; block\_hashes.len()]} (line~377), then passes the raw \texttt{token\_ids} without validating they contain enough elements to back the claimed block count. A single malformed event from any worker crashes the entire router process.
+
+The fix requires bounds validation before the loop: compute the expected total token count from \texttt{num\_block\_tokens}, compare it against \texttt{token\_ids.len()}, and return an empty result with a warning if the counts do not match. This is a defense-in-depth pattern: even though workers \emph{should} send consistent data, the router should not trust that they do.
+
+\subsection{ConcurrentRadixTree Deadlock}
+
+\begin{bugbox}
+\textbf{Bug \#2: ConcurrentRadixTree deadlock} \hfill \textsc{High} / Crash / KV-Router
+
+The concurrent radix tree silently deadlocks when a store event contains blocks with duplicate \texttt{ExternalSequenceBlockHash} values. The hand-over-hand locking protocol creates a self-referential cycle: a node becomes its own child through the lookup table, and the traversal attempts to read-lock a node that is already write-locked.
+
+\medskip
+\textbf{Sequence}:
+\begin{enumerate}
+\item Block 0 creates node B1, inserts it as a child of root, stores B1 in \texttt{worker\_lookup[hash]}.
+\item Block 1 finds B1 in the lookup and inserts B1 as a child of \emph{itself}---a self-reference.
+\item Block 2 acquires \texttt{current.write()} on B1, then calls \texttt{existing.read()} on B1 (its own child)---\textbf{deadlock}.
+\end{enumerate}
+
+The non-concurrent \texttt{RadixTree} using \texttt{Rc<RefCell>} panics with a borrow error on the same input. The concurrent variant using \texttt{Arc<RwLock>} hangs silently at 0\% CPU with no error message---a worse failure mode.
+\end{bugbox}
+
+This bug is particularly instructive because it demonstrates how the same logical error manifests differently depending on the synchronization primitive. With \texttt{RefCell}, Rust's runtime borrow checker detects the double borrow and panics immediately with a clear error message. With \texttt{RwLock}, the write lock is held by the current thread, and the read lock request blocks waiting for the write lock to release---which never happens because the same thread holds it. The result is a deadlock with no error, no log entry, and no signal to monitoring systems.
+
+The fix for both variants is the same: check for self-reference before attempting the nested lock. In the concurrent case, \texttt{Arc::ptr\_eq(existing, \&current)} detects when a node is its own child and skips the lock acquisition. Alternatively, deduplicating block hashes at the event ingestion boundary prevents the self-reference from forming in the first place.
+
+\subsection{Positional Indexer Jump-Skip}
+
+\begin{bugbox}
+\textbf{Bug \#5: Positional indexer jump-skip} \hfill \textsc{High} / Logic+Crash / KV-Router
+
+The \texttt{PositionalIndexer}'s jump-search optimization reports inflated match scores after block removal. The jump assumes that if a worker is present at positions $A$ and $B$, it must be present at all positions in $[A+1, B-1]$. Block removal violates this invariant by creating gaps.
+
+\medskip
+\textbf{Root cause} (\texttt{positional.rs:619}):
+\begin{verbatim}
+if num_workers_at_next == active.len() {
+    // Assumes all workers match at ALL intermediate positions
+    current_pos = next_pos;  // skips gap at removed position
+}
+\end{verbatim}
+
+With \texttt{jump\_size=32} and a 3-block query, the jump goes from position 0 to position 2, skipping position 1 where the block was removed. Score reported: 3. Correct score: 1.
+\end{bugbox}
+
+This bug was found by the triple differential fuzzer comparing \texttt{RadixTree}, \texttt{ConcurrentRadixTree}, and \texttt{PositionalIndexer}. The differential oracle was essential: the inflated score does not cause a crash, so a crash-only fuzzer would miss it entirely. The bug also highlights a tension in data structure design: the jump optimization exists for performance (skipping linear scans on long sequences), but its correctness invariant is not maintained under all mutation operations. Remove operations violate the monotonic coverage assumption, making the optimization unsound.
+
+\begin{notebox}
+Bugs~\#5 and \#6 form a complementary pair: the RadixTree \emph{underreports} scores while the PositionalIndexer \emph{overreports} them after removals. Neither indexer was correct for all inputs. The triple differential fuzzer caught both because it compared three implementations---any pairwise disagreement was flagged, regardless of which implementation was wrong.
+\end{notebox}
+
+
+\section{Logic Bugs}
+\label{sec:findings:logic}
+
+Logic bugs produce incorrect output without crashing. They are harder to detect than crashes because the program appears to function normally---the wrong answer is returned silently, with no panic, no error log, and no obvious signal that anything went wrong. Our campaign found 8 logic bugs, 4 of which required differential testing to detect.
+
+\subsection{RadixTree Score Underreporting}
+
+\begin{bugbox}
+\textbf{Bug \#6: RadixTree score underreporting} \hfill \textsc{High} / Logic / KV-Router
+
+\textbf{Status: FIXED upstream} (PRs \#5973, \#6122)
+
+\medskip
+The \texttt{RadixTree}'s \texttt{find\_matches} returns lower overlap scores than \texttt{PositionalIndexer} for identical stored blocks and query sequences. A worker with 3 cached blocks matching a 3-block query receives score 1 instead of 3.
+
+\medskip
+The tree traversal only counted matching \emph{tree nodes} rather than matching \emph{blocks along the path}. When a single node represents multiple blocks, the score was capped at 1 regardless of actual depth. The upstream fix rewrote the scoring to properly track \texttt{matched\_depth}.
+\end{bugbox}
+
+\marginnote{\emph{Differential testing:} running two implementations on the same input and comparing their outputs. Any divergence indicates a bug in at least one implementation.}%
+This bug has direct performance implications: underreported scores cause the router to send requests to workers that lack cached KV blocks, forcing unnecessary recomputation. The bug was found by the same triple differential fuzzer that found Bug~\#5---the \texttt{PositionalIndexer} served as the reference oracle.
+
+\subsection{Streaming vs.\ Oneshot Mismatches}
+
+Two parsers produce different output depending on whether the input arrives all at once (oneshot) or incrementally (streaming).
+
+\begin{bugbox}
+\textbf{Bug \#8: Granite streaming mismatch} \hfill \textsc{Medium} / Logic / Parsers
+
+The Granite reasoning parser drops short inputs in streaming mode. Input \texttt{"H"} returns \texttt{normal\_text = "H"} in oneshot mode but \texttt{normal\_text = ""} in streaming mode. The streaming parser buffers input waiting for potential reasoning tags (\texttt{<|thinking|>}); if no more data arrives, the buffer is never flushed.
+\end{bugbox}
+
+\begin{bugbox}
+\textbf{Bug \#9: MiniMax streaming mismatch} \hfill \textsc{Medium} / Logic / Parsers
+
+The \texttt{MiniMaxAppendThink} parser strips trailing newlines in oneshot mode but preserves them in streaming mode. Input \texttt{";{\textbackslash}n"} produces \texttt{reasoning\_text = ";"} (oneshot) vs.\ \texttt{";\textbackslash n"} (streaming).
+\end{bugbox}
+
+Both bugs were found by the \texttt{fuzz\_differential} fuzzer, which feeds the same input to both code paths and asserts equality. The contract is simple: \texttt{detect\_and\_parse\_reasoning(input)} must produce the same output as feeding \texttt{input} through \texttt{parse\_reasoning\_streaming\_incremental} in arbitrary chunks. Any deviation is a bug.
+
+\begin{insightbox}
+Streaming/oneshot equivalence is a natural differential oracle. Every parser that supports both modes implicitly promises they produce the same result. This promise is easy to state, easy to check mechanically, and---as these bugs demonstrate---easy to violate in practice. If you maintain a parser with both modes, a differential fuzzer should be your first testing investment.
+\end{insightbox}
+
+\subsection{Pythonic Prefix Leak}
+
+\begin{bugbox}
+\textbf{Bug \#7: Pythonic function name prefix leak} \hfill \textsc{High} / Logic / Parsers
+
+The pythonic tool call parser absorbs adjacent identifier characters into the function name. Input containing \texttt{vv]get\_weather(location="NYC")} extracts function name \texttt{"vvget\_weather"} instead of \texttt{"get\_weather"}.
+
+\medskip
+\textbf{Root cause} (\texttt{pythonic\_parser.rs:22}):
+\begin{verbatim}
+[a-zA-Z]+\w*\(
+\end{verbatim}
+The regex lacks a word boundary before the function name. Characters like \texttt{v} and \texttt{m} that immediately precede the real function name match \texttt{[a-zA-Z]} and are absorbed.
+\end{bugbox}
+
+This bug causes tool calls to be dispatched to the wrong function---or to fail entirely when no function matches the corrupted name. In an LLM inference server, dispatching to the wrong tool function is potentially worse than crashing: the wrong function may execute with valid arguments, causing unintended side effects that are difficult to detect and reverse.
+
+The fix is a word boundary assertion: \texttt{(?<![a-zA-Z0-9\_])[a-zA-Z]+\textbackslash w*\textbackslash(}. The negative lookbehind ensures the function name match cannot absorb characters from surrounding text. This is a one-line regex change with zero performance cost.
+
+\subsection{KimiK2 OnceLock Caching}
+
+\begin{bugbox}
+\textbf{Bug \#11: KimiK2 OnceLock caching} \hfill \textsc{Medium} / Logic / Parsers
+
+The KimiK2 parser uses \texttt{OnceLock} to cache a compiled regex, but the regex pattern depends on the model's tool configuration tokens (\texttt{call\_start}, \texttt{argument\_begin}, \texttt{call\_end}). Since \texttt{OnceLock::get\_or\_init} only initializes once per process, the first config's tokens are baked into the regex permanently. All subsequent calls with different configs silently use the stale pattern.
+
+\medskip
+\textbf{Root cause} (\texttt{kimi\_k2\_parser.rs:17--28}):
+\begin{verbatim}
+static TOOL_CALL_REGEX: OnceLock<Regex> = OnceLock::new();
+
+fn get_tool_call_regex(config: &KimiK2ParserConfig) -> &'static Regex {
+    TOOL_CALL_REGEX.get_or_init(|| {
+        let pattern = format!("...{}...{}...{}...",
+            regex::escape(&config.call_start),
+            regex::escape(&config.argument_begin),
+            regex::escape(&config.call_end));
+        Regex::new(&pattern).expect("invalid regex")
+    })
+}
+\end{verbatim}
+
+The \texttt{config} parameter is captured only during the first call. In a multi-model serving scenario, only the first model's tool call format works correctly.
+\end{bugbox}
+
+This is a subtle bug because it works perfectly in single-model deployments and only manifests when the process serves multiple models with different KimiK2 configurations---a scenario that unit tests rarely cover but production deployments frequently encounter. The \texttt{OnceLock} pattern is idiomatic Rust for lazy initialization of expensive resources, but it implicitly assumes that the initialization parameters never change. When they do, the cached value becomes stale.
+
+The fix requires replacing \texttt{OnceLock} with a config-aware caching strategy. The simplest approach is to remove caching entirely---compiling a regex for each call is fast enough for the throughput requirements of a parser. A more sophisticated approach uses a \texttt{Mutex<HashMap<ConfigKey, Regex>>} keyed by the configuration tokens.
+
+\subsection{DSML Parameter Dropping}
+
+\begin{bugbox}
+\textbf{Bug \#10: DSML parameter dropping} \hfill \textsc{Medium} / Logic / Parsers
+
+The DeepSeek V3.2 DSML parser silently drops parameters when the \texttt{string} attribute is capitalized (\texttt{string="True"} instead of \texttt{string="true"}) or omitted entirely. The regex requires a lowercase, mandatory \texttt{string} attribute.
+
+\medskip
+\textbf{Root cause} (\texttt{dsml/parser.rs:173--176}):
+\begin{verbatim}
+r#"...string=\"(true|false)\"..."#
+\end{verbatim}
+
+The regex \texttt{(true|false)} rejects \texttt{True}, \texttt{False}, and any other capitalization. The \texttt{string} attribute is required by the regex---if a model omits it, the entire parameter is silently skipped with no warning.
+\end{bugbox}
+
+This bug is characteristic of the ``impedance mismatch'' between model output and parser expectations. LLMs are trained on Python code, where \texttt{True} is capitalized. Parser regexes are written by infrastructure engineers who use lowercase \texttt{true} (the JSON convention). When the model emits Python-style capitalization, the parser's case-sensitive regex rejects it. The silent failure makes the bug particularly insidious: the tool call appears to succeed but with missing arguments, causing downstream failures that are difficult to trace back to the parser.
+
+\subsection{XML try\_literal\_eval Corruption}
+
+\begin{bugbox}
+\textbf{Bug \#12: XML try\_literal\_eval string corruption} \hfill \textsc{Medium} / Logic / Parsers
+
+The XML parser's \texttt{try\_literal\_eval} function corrupts argument values containing Python keyword substrings. Global \texttt{.replace()} calls transform \texttt{"TrueNorth"} into \texttt{"trueNorth"} and \texttt{"NoneAvailable"} into \texttt{"nullAvailable"}.
+
+\medskip
+\textbf{Root cause} (\texttt{xml/parser.rs:490--497}):
+\begin{verbatim}
+let normalized = s
+    .replace("True", "true")      // corrupts "TrueNorth"
+    .replace("False", "false")    // corrupts "Falsehood"
+    .replace("None", "null");     // corrupts "NoneAvailable"
+\end{verbatim}
+
+The replacements are applied globally to all occurrences, not just standalone Python keywords. The fix requires word-boundary-aware replacement using \texttt{\textbackslash bTrue\textbackslash b} instead of bare substring matching.
+\end{bugbox}
+
+\begin{notebox}
+The DSML, KimiK2, and XML bugs share a common theme: \emph{silent failure on unexpected input}. None of them crash---the parser simply produces wrong output and returns successfully. Without a specification-aware oracle (differential test, property assertion, or manual code review), these bugs are invisible to any amount of fuzzing.
+\end{notebox}
+
+
+\section{Arithmetic Bugs}
+\label{sec:findings:arithmetic}
+
+\marginnote{\emph{Division by zero:} Rust panics unconditionally on integer division by zero in both debug and release builds, unlike overflow which only panics in debug.}%
+The campaign found three division-by-zero bugs, each triggered by a different parameter being zero. All three follow the same pattern: a function divides by a block size or count that can be zero due to misconfiguration, and no validation guards the division.
+
+\begin{bugbox}
+\textbf{Bug \#14: Worker selector div-by-zero} \hfill \textsc{Medium} / Arithmetic / KV-Router
+
+\texttt{DefaultWorkerSelector::select\_worker} calls \texttt{isl.div\_ceil(block\_size as usize)} at \texttt{selector.rs:113} without checking that \texttt{block\_size > 0}. A zero block size crashes the router on the first scheduling request.
+\end{bugbox}
+
+\begin{bugbox}
+\textbf{Bug \#15: Block hash div-by-zero} \hfill \textsc{Medium} / Arithmetic / KV-Router
+
+\texttt{compute\_block\_hash\_for\_seq} calls \texttt{tokens.chunks\_exact(kv\_block\_size as usize)} at \texttt{protocols.rs:44}. The standard library documents that \texttt{chunks\_exact(0)} panics with ``chunk size must be non-zero.''
+\end{bugbox}
+
+\begin{bugbox}
+\textbf{Bug \#16: Request extra info div-by-zero} \hfill \textsc{Medium} / Arithmetic / KV-Router
+
+\texttt{RequestExtraInfo::to\_block\_level} contains three separate division-by-zero paths at \texttt{protocols.rs:375--382}: \texttt{total\_tokens.div\_ceil(block\_size)}, \texttt{req\_start / block\_size}, and \texttt{(req\_end - 1) / block\_size}. All three panic when \texttt{block\_size == 0}.
+\end{bugbox}
+
+The pattern is consistent: \texttt{kv\_block\_size} originates from worker configuration, flows through multiple layers of the system, and is eventually used as a divisor without validation at the point of use. No layer performs the check, because each layer assumes a previous layer already validated. This is a classic instance of the \emph{responsibility diffusion} anti-pattern in input validation: when multiple layers could validate, none does.
+
+The fix is to validate once, definitively, at the configuration boundary. When \texttt{kv\_block\_size} is first deserialized from a worker event, reject zero values immediately with a clear error message. This single check eliminates all three bugs and any future division-by-zero bugs that use the same parameter. Alternatively, Rust's type system can encode the constraint: a \texttt{NonZeroU32} wrapper type makes zero values unrepresentable, shifting the validation from runtime to compile time.
+
+\begin{insightbox}
+Division-by-zero bugs are among the easiest for a fuzzer to find. The \texttt{Arbitrary} trait generates zero values with reasonable probability, and the panic is an unambiguous crash signal. These bugs are also among the easiest to fix: a single validation at the configuration boundary eliminates the entire class. The fact that three such bugs existed in production code suggests that integer edge cases receive insufficient attention during code review.
+\end{insightbox}
+
+Additionally, the XML parser's \texttt{strip\_quotes} function produces a panic on a single-character quote input:
+
+\begin{bugbox}
+\textbf{Bug \#13: XML strip\_quotes panic} \hfill \textsc{Medium} / Panic / Parsers
+
+\texttt{strip\_quotes} panics with ``begin <= end'' when the input is exactly one quote character. The function checks \texttt{starts\_with('"') \&\& ends\_with('"')}---which is true for a single \texttt{"}---then slices \texttt{\&trimmed[1..trimmed.len()-1]}, producing \texttt{\&trimmed[1..0]}---an invalid range.
+\begin{verbatim}
+fn strip_quotes(s: &str) -> &str {
+    let trimmed = s.trim();
+    if trimmed.starts_with('"') && trimmed.ends_with('"') {
+        &trimmed[1..trimmed.len() - 1]  // panics when len == 1
+    } else { trimmed }
+}
+\end{verbatim}
+Fix: add \texttt{trimmed.len() >= 2} to the guard condition.
+\end{bugbox}
+
+
+\section{Debug vs Release Divergence}
+\label{sec:findings:divergence}
+
+The TwoPartCodec overflow (Bug~\#3) is the exemplar of a Rust-specific concern: \emph{debug/release divergence}. Rust's standard arithmetic operators behave differently depending on the build profile:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Operation} & \textbf{Debug build} & \textbf{Release build} \\
+\midrule
+\texttt{a + b} (overflow) & Panic & Silent wraparound \\
+\texttt{a * b} (overflow) & Panic & Silent wraparound \\
+\texttt{a / 0}            & Panic & Panic \\
+\texttt{a \% 0}           & Panic & Panic \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Division by zero panics in both profiles, but arithmetic overflow only panics in debug. In release, the value silently wraps around using two's complement arithmetic. This creates a dangerous situation for the TwoPartCodec:
+
+\begin{enumerate}
+\item In \textbf{debug mode} (how \texttt{cargo-fuzz} runs by default), the overflow is caught as a crash. The fuzzer reports it, the developer sees it, and it gets fixed.
+\item In \textbf{release mode} (how production runs), \texttt{24 + u64::MAX + 1} wraps to \texttt{25}. The \texttt{max\_message\_size} check passes because \texttt{25 < max\_size}. The codec then attempts to parse 25 bytes of data as a message whose header and body lengths claim to total $2^{64}$ bytes---producing garbage output from whatever happens to be in the buffer.
+\end{enumerate}
+
+\begin{bugbox}
+\textbf{The security implication}: In release mode, an attacker can bypass the codec's length validation by sending header and body lengths that sum to more than \texttt{usize::MAX}. The wrapped value passes the size check, and the codec processes a truncated buffer as if it were a valid message. Depending on what the downstream consumer does with the garbage output, this could range from a silent data corruption to a more serious exploit.
+\end{bugbox}
+
+\marginnote{\emph{Checked arithmetic:} Rust provides \texttt{checked\_add}, \texttt{checked\_mul}, etc., which return \texttt{None} on overflow instead of panicking or wrapping.}%
+The lesson is clear: any Rust code that performs arithmetic on values from untrusted input---network data, configuration files, inter-process messages---should use checked arithmetic (\texttt{checked\_add}, \texttt{checked\_mul}) or enable overflow checks in the release profile:
+
+\begin{verbatim}
+# In Cargo.toml:
+[profile.release]
+overflow-checks = true
+\end{verbatim}
+
+This configuration flag makes release builds panic on overflow just like debug builds, eliminating the divergence entirely at the cost of a small performance overhead (typically under 2\% for non-arithmetic-heavy code). The upstream fix for the TwoPartCodec correctly adopted the more targeted approach of checked arithmetic at the specific call site, which avoids the global performance cost while protecting the security-critical path.
+
+\begin{notebox}
+The debug/release divergence means that fuzzing in debug mode (the default) catches a \emph{superset} of the arithmetic bugs that exist in release mode. This is generally desirable---you want to find bugs early. But it also means you cannot assume that a crash found by the fuzzer will manifest the same way in production. Our campaign ran in debug mode and flagged overflows as crashes, then manually verified whether the silent wraparound in release mode had security or correctness implications. For the TwoPartCodec, it did.
+\end{notebox}
+
+
+\section{What Fuzzing Found vs Code Audit}
+\label{sec:findings:comparison}
+
+Of the 16 bugs, 12 were found by the fuzzer and 4 by code audit (manual review during fuzz target development). The breakdown by discovery method and bug type is shown in Table~\ref{tab:discovery-method}.
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Bug type} & \textbf{Fuzzer} & \textbf{Code audit} \\
+\midrule
+Crash (panic, deadlock, OOB)  & 4 & 0 \\
+Logic (silent corruption)     & 5 & 3 \\
+Arithmetic (div-by-zero)      & 3 & 0 \\
+Panic (edge case)             & 0 & 1 \\
+\midrule
+\textbf{Total} & \textbf{12} & \textbf{4} \\
+\bottomrule
+\end{tabular}
+\caption{Bugs by discovery method. No bugs were independently found by both methods.}
+\label{tab:discovery-method}
+\end{table}
+
+The pattern is striking:
+
+\textbf{Fuzzing found all crash and arithmetic bugs.} Every bug that manifests as a panic---whether from string slicing, integer overflow, out-of-bounds access, deadlock, or division by zero---was found by the fuzzer. These bugs require specific, non-obvious inputs that a human reviewer is unlikely to construct mentally. The GLM-4.7 bug requires a Cyrillic character with leading whitespace. The TwoPartCodec bug requires header and body lengths that sum past \texttt{usize::MAX}. The stored-blocks bug requires a mismatch between claimed block count and provided token count. In each case, the fuzzer generated the triggering input within seconds.
+
+\textbf{Code audit found the hardest-to-detect logic bugs.} Three of the eight logic bugs were found by reading the code, not by running the fuzzer. The DSML parameter dropping, KimiK2 OnceLock caching, and XML \texttt{try\_literal\_eval} corruption were all identified during the process of writing fuzz targets---understanding the code well enough to fuzz it revealed the bugs before the fuzzer ran. The XML \texttt{strip\_quotes} panic was also found by audit. These bugs are ``obvious'' once you read the code carefully, but they do not manifest as crashes, so a crash-only fuzzer would never find them.
+
+\textbf{Differential fuzzing bridges the gap.} Five logic bugs were found by the fuzzer. Four---positional indexer jump-skip, RadixTree score underreporting, Granite streaming mismatch, and MiniMax streaming mismatch---were detected by \emph{differential oracles}, not crash oracles. The fuzzer generated inputs; the oracle compared outputs from two implementations and flagged divergences. Without differential testing, these four bugs would have joined the ``audit only'' category. The Pythonic prefix leak was also found by fuzzing, but through a semantic property oracle (asserting that the extracted function name must be a substring of the known tool list) rather than a differential comparison.
+
+Consider the counterfactual: a team with only a crash-based fuzzer would find 7 bugs (the 4 crashes plus 3 division-by-zero panics). A team with only code review would find 4 bugs. Neither alone reaches even half the total. The differential fuzzer adds 4 bugs that neither crash fuzzing nor code review would catch individually, because they require both \emph{automated input generation} (fuzzer's contribution) and \emph{semantic comparison} (oracle's contribution).
+
+\begin{insightbox}
+If the campaign had relied solely on crash-based fuzzing, it would have found 7 bugs (4 crashes + 3 arithmetic) and missed 9. If it had relied solely on code audit, it would have found 4 bugs and missed 12. The combination found all 16. The key multiplier was differential testing, which allowed the fuzzer to catch logic bugs that would otherwise require human reasoning to detect.
+\end{insightbox}
+
+
+\section{Lessons Learned}
+\label{sec:findings:lessons}
+
+The 16 bugs and the process of finding them yield several methodology lessons that generalize beyond the Dynamo codebase.
+
+\subsection{Differential Testing Is the Most Powerful Oracle for Logic Bugs}
+
+Crash oracles find panics. Property oracles find invariant violations. But differential oracles find \emph{semantic discrepancies}---cases where the program returns the wrong answer without any observable failure signal. Of the 8 logic bugs found in this campaign, 3 were caught by differential oracles (streaming/oneshot comparison, triple indexer comparison). The remaining 5 required manual code review.
+
+The key insight is that differential testing converts the hard problem of ``is this output correct?'' into the easy problem of ``do these two outputs match?'' You do not need a specification to write the oracle---you only need two implementations that should agree. Dynamo provides natural differential pairs: streaming vs.\ oneshot parsers, \texttt{RadixTree} vs.\ \texttt{PositionalIndexer}, debug vs.\ release builds.
+
+\subsection{Structured Inputs Dramatically Improve Coverage}
+
+\marginnote{\emph{Arbitrary trait:} Rust's equivalent of QuickCheck generators, producing well-typed structured inputs from raw bytes.}%
+Without \texttt{Arbitrary}-based structured input generation, the fuzzer spends nearly all its time on inputs rejected by early validation. A random byte string is overwhelmingly unlikely to be valid UTF-8 containing \texttt{<tool\_call>} tags with well-formed XML attributes. Structured fuzzing generates inputs that pass surface-level validation and reach deep code paths---the byte/character confusion in the GLM-4.7 parser, the block count mismatch in the stored-blocks functions, the remove-then-query sequence that triggers the jump-skip bug.
+
+The campaign's highest-value targets all used \texttt{Arbitrary} to generate structured inputs: sequences of store/remove/query events for the KV-Router, parser configurations paired with model output strings for the parsers, and sized header/body payloads for the codec. The contrast is stark: a byte-level fuzzer running for an hour on the XML parser achieved 12\% code coverage; a structured fuzzer with \texttt{Arbitrary}-derived inputs achieved 67\% in the same time, because every generated input was syntactically valid XML that reached the deep parsing logic.
+
+\subsection{ASAN Interaction with catch\_unwind Requires Workarounds}
+
+\marginnote{\emph{ASAN:} AddressSanitizer, a compiler instrumentation that detects memory errors at runtime.}%
+Several Dynamo functions wrap their logic in \texttt{std::panic::catch\_unwind} to gracefully handle panics. When running under AddressSanitizer (the default for \texttt{cargo-fuzz}), ASAN intercepts the panic before \texttt{catch\_unwind} can handle it, causing the fuzzer to report a crash even though the production code would recover gracefully.
+
+This creates a practical problem: every known bug that panics becomes a ``blocker'' for fuzzing other code paths, because the fuzzer keeps rediscovering the same crash. Our workaround was to filter known-bug inputs at the fuzz harness level---checking whether the input would trigger a known panic and skipping it before calling the target function. This is imperfect (it requires maintaining a list of known-bad inputs) but necessary, because ASAN cannot be selectively disabled without losing its ability to detect genuine memory errors in called functions.
+
+\subsection{The Parser Zoo Is a Bug Magnet}
+
+Eight of 16 bugs (50\%) are in the parser subsystem. This is not surprising: each parser implements bespoke string manipulation for a different model family, with no shared framework, no common validation layer, and minimal test coverage. The parsers exhibit every classic string-processing error: byte/character confusion, missing boundary checks, global string replacement where word-boundary replacement is needed, case-sensitive matching where case-insensitive is required, and inconsistent streaming/oneshot behavior.
+
+A unified parsing framework with shared utilities for quote stripping, keyword normalization, and streaming/oneshot equivalence testing would eliminate entire categories of bugs. The framework should provide:
+\begin{itemize}
+  \item A safe \texttt{strip\_quotes} function that handles edge cases (single character, empty string, mismatched quotes).
+  \item Word-boundary-aware keyword replacement for Python-to-JSON normalization.
+  \item A \texttt{StreamingParser} trait with a mandatory \texttt{flush()} method and a built-in equivalence test harness.
+  \item Regex patterns that enforce word boundaries before function names.
+\end{itemize}
+Each of these utilities addresses a specific bug found in the campaign: the strip\_quotes panic, the try\_literal\_eval corruption, the streaming mismatches, and the pythonic prefix leak.
+
+\subsection{Rust Prevents Memory Bugs but Not Logic Bugs}
+
+None of the 16 bugs involve memory corruption. There are no use-after-free errors, no buffer overflows, no dangling pointers, no data races. Rust's ownership system delivers on its promise: the entire class of memory safety vulnerabilities that dominates C/C++ security advisories is absent.
+
+But the 16 bugs that remain---panics, deadlocks, logic errors, data corruption, arithmetic overflow---demonstrate that memory safety is necessary but not sufficient. A Rust codebase still needs thorough testing. The bug classes are different from C/C++, but the consequences can be equally severe. A logic bug that underreports KV cache scores degrades inference latency for every request. A codec overflow that bypasses length validation is a network-exploitable vulnerability. A parser that silently drops parameters causes downstream tool failures. None of these are memory corruption, and Rust's type system cannot prevent any of them.
+
+\begin{insightbox}
+Rust's safety guarantees shift the bug distribution, not the bug count. In a C/C++ codebase of equivalent complexity, we would expect to find buffer overflows and use-after-free bugs alongside the logic errors. In Rust, the memory bugs are eliminated at compile time, but the logic bugs, arithmetic bugs, and concurrency bugs (deadlocks, not data races) remain. Fuzzing a Rust codebase is still valuable---it just finds different bug classes.
+\end{insightbox}
+
+\subsection{Coverage Reports Reveal Blind Spots}
+
+LLVM coverage reports generated during the campaign showed that several code paths had 0\% coverage from existing fuzz targets: the Harmony parser (async architecture incompatible with synchronous fuzzing), DeepSeek V3/V3.1 specific configuration paths, ZMQ wire deserialization's \texttt{visit\_map} path, and scheduling queue logic. These blind spots directed the creation of new targets and identified areas where further fuzzing investment would be most productive.
+
+The coverage-guided workflow was iterative: (1)~run existing fuzz targets and generate an LLVM coverage report; (2)~identify functions and branches with 0\% coverage; (3)~write new fuzz targets or modify existing ones to reach uncovered code; (4)~repeat. The XML deep-parsing targets (\texttt{parse\_tool\_call\_block}, \texttt{convert\_param\_value}, \texttt{try\_literal\_eval}) went from near-zero coverage to over 80\% after targeted fuzz harnesses were written, and the \texttt{try\_literal\_eval} corruption bug was discovered during the code review that preceded writing those harnesses.
+
+\subsection{Time Investment and Returns}
+
+The campaign ran over approximately two weeks of part-time effort. The breakdown: roughly 40\% of time was spent understanding the codebase and writing fuzz targets, 20\% running the fuzzer and triaging crashes, 20\% writing bug reports and suggested fixes, and 20\% on infrastructure (coverage scripts, input filtering, ASAN workarounds). The highest return-on-investment targets were the differential fuzzers---the triple indexer differential and the streaming/oneshot differential---which found the most impactful bugs (routing score errors, data loss) with relatively simple oracles.
+
+
+\section{Summary}
+
+Table~\ref{tab:bug-summary} provides a compact view of the campaign's results by component and discovery method.
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{lccc}
+\toprule
+\textbf{Component} & \textbf{Fuzzer} & \textbf{Audit} & \textbf{Total} \\
+\midrule
+Parsers    & 4 & 4 & 8 \\
+KV-Router  & 7 & 0 & 7 \\
+Runtime    & 1 & 0 & 1 \\
+Tokens     & 0 & 0 & 0 \\
+\midrule
+\textbf{Total} & \textbf{12} & \textbf{4} & \textbf{16} \\
+\bottomrule
+\end{tabular}
+\caption{Bug distribution by component and discovery method.}
+\label{tab:bug-summary}
+\end{table}
+
+\begin{itemize}
+  \item The campaign found \textbf{16 bugs}: 7 high severity, 9 medium severity, spanning 4 crash bugs, 8 logic bugs, 3 arithmetic bugs, and 1 panic.
+  \item \textbf{Parsers} accounted for 8 of 16 bugs (50\%), making the parser zoo the single richest bug source.
+  \item \textbf{Crash bugs} (panics, deadlocks, out-of-bounds access) were found exclusively by fuzzing. Of the 8 \textbf{logic bugs}, 5 were found by fuzzing (4 via differential oracles, 1 via a property oracle) and 3 by code audit.
+  \item \textbf{Debug/release divergence} is a systemic risk in Rust: integer overflow panics in debug mode but silently wraps in release, potentially bypassing security checks. The TwoPartCodec overflow demonstrates how this can be exploited.
+  \item \textbf{Two bugs were fixed upstream} during the campaign: the TwoPartCodec overflow (PR~\#6959) and the RadixTree score underreporting (PRs~\#5973, \#6122).
+  \item \textbf{Key lessons}: differential testing is the most powerful logic-bug oracle; structured inputs are essential for coverage; the parser zoo needs a unified framework; Rust safety is necessary but not sufficient.
+  \item \textbf{Remaining blind spots}: the Harmony parser (async architecture), DeepSeek V3/V3.1 specific paths, and time-dependent scheduling logic remain at 0\% coverage and represent the highest-priority targets for future fuzzing investment.
+\end{itemize}
+
+\bigskip
+\begin{center}\rule{0.5\linewidth}{0.4pt}\end{center}
+\bigskip
+
+\noindent\textbf{Check Your Understanding}
+
+\medskip
+\noindent\emph{These questions require reasoning about the findings and methodology.}
+
+\begin{enumerate}
+  \item Why did fuzzing find all crash bugs but code audit found most logic bugs? What is it about each method that gives it an advantage for its respective bug class?
+
+  \emph{Answer:} Fuzzing excels at generating unusual inputs that trigger implicit assumption violations---byte boundaries, integer overflow, mismatched array lengths. These conditions are hard for a human to anticipate but easy for a fuzzer to stumble upon. Code audit excels at reasoning about semantic correctness: ``this regex only matches lowercase, but models may emit uppercase.'' Logic bugs do not crash, so the fuzzer's crash oracle cannot detect them. Audit reasons about specifications; fuzzing explores input spaces.
+
+  \item The TwoPartCodec overflow is rated High despite being ``just'' an integer overflow. Explain the attack scenario: how could a malicious actor exploit the debug/release divergence to bypass the codec's length validation?
+
+  \emph{Answer:} In release mode, \texttt{24 + header\_len + body\_len} wraps to a small value when the sum exceeds \texttt{usize::MAX}. This small value passes the \texttt{max\_message\_size} check. The codec then reads \texttt{header\_len} bytes from a buffer that contains only the wrapped number of bytes, producing garbage data that is passed to the downstream consumer as a valid message. An attacker sends 24 bytes with carefully chosen length fields to control what garbage data the consumer sees.
+
+  \item Three division-by-zero bugs were found across different KV-Router functions, all triggered by \texttt{kv\_block\_size == 0}. What does this pattern suggest about the codebase's approach to input validation? Propose a systematic fix.
+
+  \emph{Answer:} The pattern suggests ``validate at the point of use'' is not working---each function assumes a previous layer validated the block size, but no layer actually does. The systematic fix is to validate once, at the configuration boundary: when \texttt{kv\_block\_size} is deserialized from a worker configuration event, reject zero values immediately. This eliminates the entire class of bugs with a single check, rather than adding guards to every function that divides.
+
+  \item The ConcurrentRadixTree deadlock manifests as a silent hang at 0\% CPU, while the same bug in the non-concurrent RadixTree causes an immediate panic. Which failure mode is worse for a production system, and why?
+
+  \emph{Answer:} The silent hang is worse. A panic terminates the thread and produces an error message---monitoring systems can detect it, alerting can fire, and the process can be restarted automatically. A deadlock produces no error, no log entry, and no signal that anything is wrong. The thread simply stops processing requests. Other threads may continue working, so the system appears partially functional. The hung thread holds resources (locks, memory) indefinitely. Diagnosing the problem requires attaching a debugger or analyzing thread dumps, which is much harder than reading a panic backtrace.
+
+  \item The Pythonic parser's prefix leak (Bug~\#7) causes tool calls to be dispatched to the wrong function. Why is this a High-severity bug even though it does not crash?
+
+  \emph{Answer:} Calling the wrong function with valid arguments is potentially more dangerous than crashing. A crash is a denial of service---the request fails and the user retries. But dispatching to the wrong function can cause unintended side effects: deleting instead of creating, sending to the wrong recipient, executing an unintended operation. The system appears to work normally, making the error harder to detect and potentially causing irreversible damage.
+
+  \item The Granite streaming mismatch drops short inputs like \texttt{"H"} in streaming mode. Under what realistic production conditions would this bug manifest?
+
+  \emph{Answer:} This manifests when (1) the model's first generated token produces a single character before any reasoning markers, and (2) the chunk size is small enough that this character arrives as its own streaming chunk. With continuous batching and token-level streaming---exactly the architecture Dynamo implements---every token is a separate streaming event. The first token of a non-reasoning response would be silently dropped, causing the user to see output starting from the second token.
+
+  \item The campaign found that ASAN intercepts panics before \texttt{catch\_unwind} can handle them. Why can't we simply disable ASAN for functions that use \texttt{catch\_unwind}?
+
+  \emph{Answer:} ASAN is a whole-program instrumentation---it cannot be selectively disabled for individual functions without losing coverage for memory errors in those functions' callees. If a function wrapped in \texttt{catch\_unwind} calls code with a genuine memory error (e.g., an out-of-bounds read in an unsafe block), disabling ASAN would miss it. The workaround of filtering known-bug inputs at the harness level is imperfect but preserves ASAN's ability to detect real memory errors while avoiding false positives from expected panics.
+
+  \item Two of the 16 bugs were already fixed upstream before our campaign ended (TwoPartCodec, RadixTree score). What does this tell us about the value of independent fuzzing campaigns on actively developed codebases?
+
+  \emph{Answer:} It demonstrates that independent fuzzing campaigns can discover bugs that internal testing eventually finds, but the campaign often finds them first or simultaneously. The TwoPartCodec overflow was reported through our campaign and fixed via our upstream issue. The RadixTree scoring was fixed in a refactor that happened to address the bug we found. Independent fuzzing provides value even on actively developed code: it finds bugs faster (automated vs.\ manual discovery), it provides concrete reproduction cases (crash artifacts), and it validates that fixes are correct (regression testing). The overlap is a sign that the bugs are real and important, not that the effort was wasted.
+\end{enumerate}

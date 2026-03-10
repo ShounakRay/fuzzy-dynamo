@@ -1,0 +1,548 @@
+\chapter{Fuzzing the System}
+\label{ch:fuzzing}
+
+The previous chapters explained how Dynamo works. This chapter explains how we broke it. \emph{Fuzzing} is an automated testing technique that generates random or semi-random inputs and feeds them to a program, looking for crashes, hangs, or incorrect behavior. When applied systematically to Dynamo's Rust libraries, it found 16 bugs across 36 fuzz targets in approximately 141 million test executions. This chapter explains what fuzzing is, how coverage-guided fuzzing works, why the oracle problem is the central challenge, and how we designed and executed the campaign.
+
+
+\section{What Is Fuzzing?}
+\label{sec:fuzzing:what}
+
+\marginnote{\emph{Fuzzing:} automated testing by generating inputs and observing whether the program crashes or misbehaves.}%
+At its simplest, fuzzing is feeding garbage to a program and seeing what happens. The insight that makes it powerful is that programs often fail on inputs their developers never considered---not because the developers were careless, but because the space of possible inputs is astronomically large. A function that processes a byte sequence has $256^n$ possible inputs of length $n$. No amount of hand-written unit tests can cover more than a vanishingly small fraction of this space.
+
+Fuzzing automates the search through this space. A \emph{fuzzer} generates inputs, feeds them to the target function (called the \emph{harness}), observes the result, and repeats---millions or billions of times. The simplest fuzzers generate completely random bytes. More sophisticated fuzzers use feedback from the program's execution to guide their search toward interesting inputs.
+
+\subsection{A Brief History}
+
+The idea is older than most programmers realize. In 1988, Barton Miller at the University of Wisconsin assigned his graduate students a simple project: write a program that generates random characters and pipes them to Unix utilities. A startling number of standard tools---including programs in \texttt{/usr/bin} that had been in production for years---crashed or hung. The lesson was immediate: software that works on expected inputs often fails spectacularly on unexpected ones.
+
+\marginnote{\emph{AFL:} American Fuzzy Lop, a landmark coverage-guided fuzzer released by Michal Zalewski in 2013.}%
+For two decades, fuzzing remained a niche technique. The breakthrough came with \emph{coverage-guided fuzzing}, pioneered by tools like AFL (American Fuzzy Lop, 2013) and LLVM's libFuzzer. These tools use code coverage as a feedback signal: if a mutated input reaches new code paths, the fuzzer saves it and mutates it further. This transforms fuzzing from random bombardment into an evolutionary search through the program's state space. Google's OSS-Fuzz project, launched in 2016, runs continuous fuzzing on hundreds of open-source projects and has found over 10,000 bugs.
+
+In the Rust ecosystem, the standard tool is \texttt{cargo-fuzz}, which wraps libFuzzer with Rust-specific support for structured input generation via the \texttt{Arbitrary} trait. This is what we used for the Dynamo campaign.
+
+\begin{notebox}
+Fuzzing Rust code differs from fuzzing C/C++ in a fundamental way. In C, the primary targets are memory corruption bugs: buffer overflows, use-after-free, and null dereferences. In safe Rust, these bugs are eliminated by the compiler. The bugs that remain---and that our fuzzer found---are panics (denial of service), logic errors (silent data corruption), and debug/release divergence (different behavior depending on build profile). This shifts the fuzzer's role from ``find memory safety violations'' to ``find crashes and semantic bugs.''
+\end{notebox}
+
+\begin{whynotbox}{Why not use property-based testing instead of fuzzing?}
+Property-based testing (PBT) frameworks like QuickCheck and proptest also generate random inputs and check assertions. The key difference is \emph{feedback}. PBT generates inputs from a distribution defined by the programmer---it has no visibility into which code paths a given input exercises. Coverage-guided fuzzing uses runtime instrumentation to \emph{observe} which branches each input takes, then preferentially mutates inputs that reach new code. This means fuzzing can discover deep, multi-step code paths that PBT's distribution would almost never produce. PBT is better when you have strong domain knowledge about the input distribution and want to verify specific properties. Fuzzing is better when you want to explore the full input space, including edge cases you did not anticipate. In practice, the two techniques are complementary: we used \texttt{Arbitrary} (a PBT-style input generator) \emph{inside} the coverage-guided fuzzing loop, getting the best of both.
+\end{whynotbox}
+
+
+\section{Coverage-Guided Fuzzing}
+\label{sec:fuzzing:coverage}
+
+\marginnote{\emph{Coverage-guided fuzzing:} using code coverage feedback to guide input generation toward unexplored execution paths.}%
+Pure random fuzzing is inefficient: most random inputs exercise the same few code paths (early validation checks, error returns). \emph{Coverage-guided fuzzing} solves this by instrumenting the target program to report which code paths each input exercises. When an input reaches a new code path (a branch not previously taken, a function not previously called), the fuzzer saves it as a \emph{seed} and mutates it to explore further.
+
+The feedback loop works as follows:
+\begin{enumerate}
+  \item The fuzzer generates or mutates an input.
+  \item The harness runs with the input. Compiler instrumentation records which basic blocks and edges between them are executed.
+  \item If the input triggered new coverage (reached code not previously reached by any input), the fuzzer adds it to its \emph{corpus}---a growing collection of interesting inputs.
+  \item The fuzzer selects an input from the corpus, applies random mutations (bit flips, byte insertions, splicing two inputs together), and repeats from step 1.
+\end{enumerate}
+
+Over time, the corpus evolves toward inputs that collectively cover more of the target's code. The fuzzer automatically discovers edge cases, boundary values, and unusual code paths---not because it understands the code, but because the coverage feedback rewards inputs that explore new territory.
+
+Figure~\ref{fig:fuzzing-loop} illustrates the feedback loop as a cycle. The key property is that the corpus grows monotonically: once an input discovers new coverage, it is never discarded (though it may be replaced during corpus minimization by a smaller input that covers the same edges).
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+    node distance=1.6cm,
+    every node/.style={font=\small},
+    block/.style={rectangle, draw, rounded corners=3pt, minimum width=2.4cm, minimum height=0.9cm, align=center, fill=blue!8},
+    decision/.style={diamond, draw, aspect=2.2, inner sep=1pt, align=center, fill=orange!10},
+    arr/.style={-{Stealth[length=6pt]}, thick},
+]
+    \node[block] (gen) {Generate /\\Mutate Input};
+    \node[block, right=2.0cm of gen] (exec) {Execute\\Harness};
+    \node[decision, right=2.0cm of exec] (cov) {New\\coverage?};
+    \node[block, below=1.4cm of cov] (save) {Save to\\Corpus};
+    \node[block, below=1.4cm of gen] (select) {Select from\\Corpus};
+
+    \draw[arr] (gen) -- (exec);
+    \draw[arr] (exec) -- (cov);
+    \draw[arr] (cov) -- node[right, font=\footnotesize] {yes} (save);
+    \draw[arr] (cov.north) -- ++(0,0.8) -| node[pos=0.25, above, font=\footnotesize] {no (discard)} (gen.north);
+    \draw[arr] (save) -- (select);
+    \draw[arr] (select) -- (gen);
+\end{tikzpicture}
+\caption{The coverage-guided fuzzing feedback loop. Inputs that discover new code paths are saved to the corpus; inputs that do not are discarded. The corpus grows monotonically, and mutations are drawn from it, creating an evolutionary search through the program's input space.}
+\label{fig:fuzzing-loop}
+\end{figure}
+
+\subsection{How libFuzzer Works}
+
+LibFuzzer, the engine behind \texttt{cargo-fuzz}, instruments the target binary at compile time using LLVM's SanitizerCoverage pass. This inserts a callback at every \emph{edge} in the control-flow graph---every branch between basic blocks. At runtime, libFuzzer maintains a coverage map: a fixed-size array where each entry corresponds to a hashed edge identifier. When an input exercises a previously unseen edge (or hits an edge a new number of times), it is ``interesting'' and is added to the corpus.
+
+\marginnote{\emph{Corpus minimization:} reducing the corpus to the smallest set of inputs that preserves total coverage.}%
+LibFuzzer also performs \emph{corpus minimization}: periodically removing inputs that are redundant (their coverage is a subset of other inputs' coverage). This keeps the corpus small and focused, which speeds up subsequent mutations. When a crash is found, libFuzzer performs \emph{crash minimization}: iteratively shrinking the crashing input while preserving the crash, producing a minimal reproducer.
+
+\begin{insightbox}
+Coverage-guided fuzzing is a form of evolutionary search. Inputs that explore new code paths are ``fit'' and survive (are kept in the corpus and mutated further). Inputs that cover only already-explored paths are ``unfit'' and discarded. The corpus gradually evolves toward comprehensive code coverage, with mutations acting as the variation mechanism and coverage feedback as the selection pressure.
+\end{insightbox}
+
+A concrete example from our campaign illustrates the power of this approach. The \texttt{fuzz\_codec\_\allowbreak crash\_oracle} target feeds random bytes to the \texttt{TwoPartCodec} decoder. Early random inputs all fail the length check (the decoder requires at least 24 bytes for the fixed preamble). But eventually, the fuzzer generates a 24-byte input that passes the length check and reaches the field-parsing code. This input is saved. Further mutations explore the space of valid-length inputs, eventually producing one where the \texttt{header\_len} and \texttt{body\_len} fields are near \texttt{u64::MAX}. The addition \texttt{24 + header\_len + body\_len} overflows, and the fuzzer records a crash.
+
+No human tester would write a unit test with \texttt{header\_len = 0xFFFFFFFFFFFFFFFF}. The fuzzer discovered it because coverage feedback rewarded inputs that passed the length check, and random mutation eventually produced extreme field values. This is the core value proposition of coverage-guided fuzzing: it systematically explores the space of inputs that reach deep code paths, including corner cases that humans overlook.
+
+
+\section{The Oracle Problem}
+\label{sec:fuzzing:oracle}
+
+\marginnote{\emph{Oracle:} a mechanism that determines whether a program's output is correct for a given input.}%
+Fuzzing finds \emph{inputs}. But an input is only useful if we can determine whether the program's behavior on that input is correct or incorrect. This determination requires an \emph{oracle}---a source of truth about what the correct behavior should be. The \textbf{oracle problem} is the central challenge of fuzzing: crashes are easy to detect (the program aborts), but \emph{silent correctness bugs} are hard to detect because the program runs to completion and produces output that \emph{looks} fine.
+
+We used four oracle strategies in the Dynamo campaign:
+
+\textbf{Crash oracle.} The simplest: if the program panics, it is a bug. This catches division by zero, out-of-bounds indexing, \texttt{unwrap()} on \texttt{None}, integer overflow (in debug builds), and \texttt{RefCell} borrow violations. Every crash bug in Chapter~\ref{ch:findings} was found this way. The \texttt{fuzz\_codec\_crash\_oracle} target (Section~\ref{sec:fuzzing:infra}) is a pure crash oracle---it exercises five different decoders and asserts nothing, relying entirely on panics to signal bugs:
+
+\begin{lstlisting}[language=Rust,caption={Crash oracle: the harness asserts nothing; any panic is a bug.}]
+fuzz_target!(|data: &[u8]| {
+    let bytes = Bytes::copy_from_slice(data);
+    let codec = TwoPartCodec::new(None);
+    let _ = codec.decode_message(bytes.clone());
+    let codec_limited = TwoPartCodec::new(Some(1024));
+    let _ = codec_limited.decode_message(bytes.clone());
+    let _ = TcpRequestMessage::decode(&bytes);
+    let _ = Frame::decode(bytes);
+});
+\end{lstlisting}
+
+\textbf{Differential oracle.} Run two implementations on the same input and compare outputs. If they disagree, at least one has a bug. We used this for parsers (streaming vs.\ oneshot) and for the three KV-cache indexer implementations. Section~\ref{sec:fuzzing:differential} covers this in detail.
+
+\textbf{Property oracle.} Assert invariants that must hold regardless of input. For example: the codec's round-trip property (encode then decode must return the original data), the radix tree's score bound (no score can exceed the query length), or the token block sequence's length tracking (total tokens must match the count of appends minus pops). These are embedded as \texttt{assert!} statements in the harness.
+
+\textbf{Assertion oracle.} Embed postcondition checks that convert semantic expectations into crash signals. If a postcondition is violated, the assertion panics, and the fuzzer records it as a crash. For example, after \texttt{select\_worker} returns, we assert that the selected worker ID actually exists in the worker set:
+
+\begin{lstlisting}[language=Rust,caption={Assertion oracle: postcondition check on worker selection.}]
+match selector.select_worker(&workers, &request, block_size) {
+    Ok(selection) => {
+        assert!(workers.contains_key(&selection.worker.worker_id),
+            "Selected worker {} not in worker set",
+            selection.worker.worker_id);
+    }
+    Err(_) => {} // NoEndpoints is fine
+}
+\end{lstlisting}
+
+\begin{notebox}
+The oracle problem explains why 4 of the 16 bugs were found by code audit rather than fuzzing. Logic bugs like ``parser drops text after the second tool call'' produce output that differs from the correct result, but the fuzzer has no way to know what the correct result is unless we encode the expectation as a property or differential test. The code auditor, reading the specification and the code side by side, can spot the discrepancy directly.
+\end{notebox}
+
+
+\section{Structuring Inputs with Arbitrary}
+\label{sec:fuzzing:arbitrary}
+
+\marginnote{\emph{Arbitrary:} a Rust trait for generating structured values from raw bytes, bridging the gap between random byte streams and typed program inputs.}%
+Most of Dynamo's functions do not accept raw byte slices. The router expects a list of token IDs and a worker configuration. The parser expects a model output string and a tool specification. The codec expects a preamble with specific field widths. Feeding random bytes to these functions would waste most of the fuzzer's effort on inputs rejected by early validation.
+
+The \texttt{Arbitrary} trait (from the \texttt{arbitrary} crate) solves this by defining how to construct structured values from raw bytes. By deriving \texttt{Arbitrary} on the input types, we let the fuzzer generate valid-by-construction inputs: token ID sequences of realistic lengths, configuration structs with plausible field values, and model output strings containing the delimiters that parsers look for.
+
+\subsection{Before: Manual Byte Parsing}
+
+Without \texttt{Arbitrary}, the harness author must manually decode the fuzzer's byte stream into structured parameters. This is tedious and error-prone. Here is how the \texttt{fuzz\_worker\_selector} target parses configuration from raw bytes:
+
+\begin{lstlisting}[language=Rust,caption={Manual input parsing: extracting structured fields from raw bytes.}]
+fuzz_target!(|data: &[u8]| {
+    if data.len() < 12 { return; }
+    let num_workers = (data[0] % 8) as u64 + 1;
+    let isl_tokens = u16::from_le_bytes([data[1], data[2]]) as usize;
+    let block_size = (data[3] % 64) as u32 + 1;
+    let temp_raw = u16::from_le_bytes([data[4], data[5]]);
+    let temperature = match temp_raw % 8 {
+        0 => 0.0,     // greedy
+        1 => 0.001,   // near-greedy
+        3 => 1.0,     // standard
+        4 => 10.0,    // high temp
+        _ => (temp_raw as f64) / 1000.0,
+    };
+    // ... 50 more lines of byte decoding ...
+});
+\end{lstlisting}
+
+Every field must be manually extracted, range-clamped, and validated. The fuzzer's mutations operate on raw bytes, so a bit flip in byte 0 changes the number of workers while a bit flip in byte 4 changes the temperature---the fuzzer has no concept of these semantic boundaries.
+
+\subsection{After: Derived Arbitrary}
+
+With \texttt{Arbitrary}, we declare the input type and let the framework handle the byte-to-struct mapping:
+
+\begin{lstlisting}[language=Rust,caption={Structured input with \texttt{Arbitrary}: the fuzzer generates typed values directly.}]
+#[derive(Debug, Arbitrary)]
+struct FuzzInput {
+    block_size: u32,
+    num_workers: u8,
+    isl_tokens: u16,
+    temperature: u8,
+    overlap_weight: u8,
+    dp_sizes: Vec<u8>,
+    overlap_scores: Vec<(u8, u8, u32)>,
+}
+
+fuzz_target!(|input: FuzzInput| {
+    let num_workers = (input.num_workers % 8) as usize;
+    if num_workers == 0 { return; }
+    // ... use input.block_size, input.temperature directly ...
+});
+\end{lstlisting}
+
+The \texttt{Arbitrary} derive macro generates an implementation that reads the fuzzer's byte stream and produces a well-formed \texttt{FuzzInput} struct, including variable-length \texttt{Vec} fields. The fuzzer's mutations now operate on bytes that correspond to semantically meaningful fields.
+
+\subsection{Structured Enums for Stateful Targets}
+
+For stateful targets like the radix tree, we define an enum of operations that the fuzzer sequences into a test scenario:
+
+\begin{lstlisting}[language=Rust,caption={Operation enum for stateful fuzzing of the KV-cache indexer.}]
+#[derive(Debug, Arbitrary)]
+pub enum FuzzOp {
+    Store { worker_id: u8, hashes: Vec<u8> },
+    Remove { worker_id: u8, index: u8 },
+    Clear { worker_id: u8 },
+    Query { seq: Vec<u8>, early_exit: bool },
+}
+
+#[derive(Debug, Arbitrary)]
+pub struct FuzzInput {
+    pub ops: Vec<FuzzOp>,
+}
+\end{lstlisting}
+
+The fuzzer generates a sequence of \texttt{Store}, \texttt{Remove}, \texttt{Clear}, and \texttt{Query} operations, each with their own parameters. This is how we found the RadixTree score underreporting bug (Section~\ref{sec:fuzzing:differential}): the fuzzer discovered a particular interleaving of stores and queries that exposed the mismatch.
+
+\begin{insightbox}
+Structured fuzzing with \texttt{Arbitrary} is the bridge between the fuzzer's raw byte manipulation and the target's typed input expectations. It turns the fuzzer from a ``random byte cannon'' into a ``random \emph{valid input} cannon''---dramatically increasing the fraction of generated inputs that exercise meaningful code paths rather than being rejected at the parsing boundary.
+\end{insightbox}
+
+
+\section{Differential Testing}
+\label{sec:fuzzing:differential}
+
+Differential testing compares the outputs of two or more implementations that should agree. It is our most powerful oracle strategy, because it detects semantic bugs---bugs where the program produces wrong output without crashing. In the Dynamo campaign, we applied it in three forms.
+
+\subsection{Triple Differential: RadixTree vs.\ PositionalIndexer vs.\ ConcurrentRadixTree}
+
+The \texttt{fuzz\_triple\_differential} target is the most sophisticated harness in the campaign. It maintains three independent implementations of the KV-cache indexer---\texttt{RadixTree}, \texttt{ConcurrentRadixTree}, and \texttt{PositionalIndexer}---and feeds the same sequence of \texttt{Store}, \texttt{Remove}, \texttt{Clear}, and \texttt{Query} operations to all three. After each \texttt{Query}, it asserts that all three return identical overlap scores:
+
+\begin{lstlisting}[language=Rust,caption={Triple differential: three implementations must agree on every query.}]
+let r_radix = radix.find_matches(seq.clone(), false);
+let r_concurrent = concurrent.find_matches_impl(&seq, false);
+let r_positional = positional.find_matches(&seq, false);
+
+// RadixTree == ConcurrentRadixTree (exact match)
+assert_eq!(r_radix.scores, r_concurrent.scores,
+    "Radix vs Concurrent score mismatch");
+
+// All three must agree on scores
+assert_eq!(r_radix.scores, r_positional.scores,
+    "Radix vs Positional score mismatch");
+\end{lstlisting}
+
+This harness found the RadixTree score underreporting bug: after a specific sequence of store operations, the RadixTree reported a score of 1 for a worker that had three matching blocks, while the PositionalIndexer correctly reported 3. Without the differential oracle, this bug would have been invisible---the RadixTree did not crash, and its output was structurally valid. Only by comparing against a second implementation could we detect that the score was wrong.
+
+\begin{bugbox}
+\textbf{RadixTree Score Underreporting.} The RadixTree's \texttt{find\_matches} traversal counted one match per tree node visited, not per block matched. When a tree node represented multiple blocks (after merging), the score was undercounted. This caused the router to undervalue workers with cached KV blocks, leading to unnecessary recomputation and degraded inference latency. Found by \texttt{fuzz\_triple\_differential}.
+\end{bugbox}
+
+\subsection{Streaming vs.\ Oneshot Differential}
+
+The parser differential target (\texttt{fuzz\_differential}) feeds the same text to both the oneshot parser (\texttt{detect\_and\_parse\_reasoning}) and the streaming parser (\texttt{parse\_reasoning\_streaming\_incremental}), comparing their outputs:
+
+\begin{lstlisting}[language=Rust,caption={Streaming vs.\ oneshot differential for reasoning parsers.}]
+let mut oneshot = parser_type.get_reasoning_parser();
+let oneshot_result = oneshot.detect_and_parse_reasoning(s, &[]);
+
+let mut streaming = parser_type.get_reasoning_parser();
+let mut stream_reasoning = String::new();
+for chunk in StreamingChunker::new(s, chunk_size, seed) {
+    let r = streaming.parse_reasoning_streaming_incremental(
+        chunk, &[]);
+    stream_reasoning.push_str(&r.reasoning_text);
+}
+
+assert_eq!(oneshot_result.reasoning_text, stream_reasoning,
+    "Reasoning mismatch for {:?}", parser_type);
+\end{lstlisting}
+
+The \texttt{StreamingChunker} is a custom iterator that splits text into chunks using one of four strategies (single byte, pseudorandom length, medium chunks, or whole text), controlled by the fuzzer. This tests that the streaming parser produces identical output regardless of how the input is chunked---a property that must hold but is easy to violate in state-machine-based parsers.
+
+This harness exposed the Granite streaming mismatch bug: the Granite parser's streaming mode dropped characters at chunk boundaries when reasoning markers spanned two chunks. The key design element is the \texttt{StreamingChunker}, which uses four chunking strategies controlled by the fuzzer:
+
+\begin{itemize}
+  \item \textbf{Strategy 0:} Single-byte chunks (most aggressive, tests every possible split point).
+  \item \textbf{Strategy 1:} Pseudorandom lengths from 1--16 bytes (tests irregular boundaries).
+  \item \textbf{Strategy 2:} Medium chunks of 4--32 bytes (tests realistic streaming scenarios).
+  \item \textbf{Strategy 3:} Entire text in one chunk (degenerates to oneshot, serving as a baseline).
+\end{itemize}
+
+The chunker also handles UTF-8 safety: if a chunk boundary falls in the middle of a multibyte character, it advances the boundary to the next character start. This ensures the streaming parser always receives valid UTF-8, isolating parser bugs from encoding errors.
+
+\subsection{Determinism Assertions}
+
+A simpler form of differential testing compares a function against itself. Running the same input twice through a deterministic function should produce identical output. If it does not, the function has hidden state or nondeterminism. We use this in the \texttt{fuzz\_stored\_blocks} harness:
+
+\begin{lstlisting}[language=Rust,caption={Determinism assertion: same input must produce same output.}]
+let blocks = create_stored_blocks(kv_block_size, &token_ids,
+    &num_block_tokens, &block_hashes, None, &wc, None);
+let blocks2 = create_stored_blocks(kv_block_size, &token_ids,
+    &num_block_tokens, &block_hashes, None, &wc2, None);
+assert_eq!(blocks.len(), blocks2.len(),
+    "create_stored_blocks not deterministic");
+\end{lstlisting}
+
+
+\section{Campaign Design}
+\label{sec:fuzzing:design}
+
+\subsection{Target Selection}
+
+Not every component in a large system is amenable to fuzzing. We selected targets based on three criteria:
+
+\begin{enumerate}
+  \item \textbf{Pure Rust, no async.} The target function must be callable synchronously from a single thread. This rules out components that require a Tokio runtime, GPU access, or network connections.
+  \item \textbf{Deterministic.} Given the same input, the function must produce the same output. Nondeterministic functions (those depending on wall-clock time, random number generators, or concurrent state) produce false positives.
+  \item \textbf{Accepts structured input.} The function must have a well-defined input type that we can generate via \texttt{Arbitrary} or manual byte parsing.
+\end{enumerate}
+
+These criteria led to four crates:
+
+\begin{center}
+\begin{tabular}{lrl}
+\toprule
+\textbf{Crate} & \textbf{Targets} & \textbf{Focus} \\
+\midrule
+\texttt{lib/parsers} & 15 & Output parsing, tool calls, reasoning \\
+\texttt{lib/kv-router} & 14 & Radix tree, routing, worker selection \\
+\texttt{lib/tokens} & 3 & Block hashing, positional encoding \\
+\texttt{lib/runtime} & 4 & Codec, wire format, slug parsing \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Components we explicitly excluded: the Tokio-based HTTP frontend (async, nondeterministic), the GPU inference engine (requires hardware), the etcd-based service discovery (requires external state), and the Kubernetes operator (written in Go).
+
+\subsection{Harness Design Principles}
+
+Each harness follows a common pattern:
+
+\begin{enumerate}
+  \item \textbf{Input generation.} Accept either raw \texttt{\&[u8]} (for simple targets) or a struct deriving \texttt{Arbitrary} (for complex targets). Clamp input sizes to prevent the fuzzer from generating pathologically large inputs that slow down execution.
+  \item \textbf{Known-bug filtering.} At the top of the harness, check whether the input would trigger a known bug and return early if so. This prevents the fuzzer from repeatedly rediscovering the same crash.
+  \item \textbf{Execution.} Call the target function with the generated input.
+  \item \textbf{Oracle checks.} Assert postconditions, compare against a reference implementation, or simply let panics propagate.
+\end{enumerate}
+
+The \texttt{fuzz\_xml\_deep} target illustrates all four principles. It generates structured XML tool calls via \texttt{Arbitrary}, filters inputs that trigger the known \texttt{strip\_quotes} panic (Bug~\#13), invokes the XML parser with and without tool definitions, and tests additional Python-style value inputs to exercise the \texttt{try\_literal\_eval} code path:
+
+\begin{lstlisting}[language=Rust,caption={Filtering known bugs at the top of the harness.}]
+fn is_safe_name(s: &str) -> bool {
+    let t = s.trim();
+    !(t == "\"" || t == "'")  // Bug #13: strip_quotes panic
+}
+
+fuzz_target!(|input: FuzzInput| {
+    if !is_safe_name(&input.func_name) { return; }
+    for (name, _) in &input.params {
+        if !name.is_empty() && !is_safe_name(name) { return; }
+    }
+    // ... proceed with fuzzing ...
+});
+\end{lstlisting}
+
+\subsection{Target Coverage}
+
+The parser crate had the most targets because it contains 14 named parser configurations (Hermes, Mistral, DeepSeek v3/v3.1/v3.2, GLM-4.7, Kimi K2, Pythonic, and others), each with distinct delimiters, state machines, and edge cases. The \texttt{fuzz\_named\_configs} target exercises all 14 in a single harness:
+
+\begin{lstlisting}[language=Rust,caption={Crash oracle across all 14 named parser configurations.}]
+let configs: &[ToolCallConfig] = &[
+    ToolCallConfig::hermes(),
+    ToolCallConfig::llama3_json(),
+    ToolCallConfig::mistral(),
+    ToolCallConfig::deepseek_v3(),
+    ToolCallConfig::glm47(),
+    ToolCallConfig::kimi_k2(),
+    // ... 8 more ...
+];
+for config in configs {
+    match &config.parser_config {
+        ParserConfig::Json(c) =>
+            { let _ = try_tool_call_parse_json(s, c, None); }
+        ParserConfig::Xml(c) =>
+            { let _ = try_tool_call_parse_xml(s, c, None); }
+        // ... other parser types ...
+    }
+}
+\end{lstlisting}
+
+The tokens crate targets focused on property testing: the \texttt{fuzz\_token\_block\_sequence} target maintains a shadow count of total tokens and asserts it matches the \texttt{TokenBlockSequence}'s own count after every operation (append, pop, truncate, unwind, reset, extend)---a property oracle that would catch any bookkeeping error in the block sequence implementation. The \texttt{fuzz\_positional\_hash} target verifies round-trip correctness and mode selection for positional sequence hashes across boundary values (255, 256, 65535, 65536), testing that the compact 128-bit encoding faithfully preserves position and hash data across mode transitions.
+
+The runtime crate's \texttt{fuzz\_two\_part\_roundtrip} target tests the codec's fundamental correctness property: encoding a message and decoding the result must return the original header and body bytes:
+
+\begin{lstlisting}[language=Rust,caption={Round-trip property oracle for the TwoPartCodec.}]
+let encoded = codec.encode_message(
+    TwoPartMessage::new(header.clone(), body.clone()))?;
+let decoded = codec.decode_message(encoded)
+    .expect("encode succeeded but decode failed");
+let (dec_header, dec_data) = decoded.into_parts();
+assert_eq!(dec_header, header, "header mismatch");
+assert_eq!(dec_data, body, "data mismatch");
+\end{lstlisting}
+
+This tests not just that the codec does not crash, but that it preserves data integrity---a property oracle that catches silent corruption bugs that a pure crash oracle would miss.
+
+
+\section{Infrastructure}
+\label{sec:fuzzing:infra}
+
+\subsection{Project Layout}
+
+Each fuzz crate lives inside its target crate as a subdirectory, with its own \texttt{Cargo.toml} and workspace declaration to isolate it from the main workspace:
+
+\begin{lstlisting}[caption={Fuzz crate layout (kv-router example).}]
+lib/kv-router/
+  src/              # library source
+  fuzz/
+    Cargo.toml      # [package.metadata] cargo-fuzz = true
+    src/lib.rs      # shared types: FuzzOp, make_store_event()
+    fuzz_targets/   # one .rs file per target
+      fuzz_radix_tree_events.rs
+      fuzz_triple_differential.rs
+      fuzz_worker_selector.rs
+      ...
+    corpus/          # persisted interesting inputs (per target)
+    artifacts/       # crash reproducer files (per target)
+\end{lstlisting}
+
+Each target is declared as a \texttt{[[bin]]} in \texttt{Cargo.toml}. The shared library (\texttt{src/lib.rs}) contains helper types and functions used by multiple targets---for example, the \texttt{FuzzOp} enum and the \texttt{make\_store\_event} function that constructs correctly-chained \texttt{RouterEvent}s with proper sequence hash computation.
+
+\subsection{Running Campaigns}
+
+A fuzzing run is launched with a single command:
+
+\begin{lstlisting}[language=bash,caption={Running a fuzz target for 120 seconds.}]
+cd lib/kv-router/fuzz
+~/.cargo/bin/cargo +nightly fuzz run fuzz_triple_differential \
+    -- -max_total_time=120
+\end{lstlisting}
+
+The \texttt{+nightly} flag is required because fuzzing relies on unstable compiler features (sanitizer instrumentation, coverage passes). The \texttt{-max\_total\_time} flag sets a time budget in seconds. Without it, libFuzzer runs indefinitely.
+
+During execution, libFuzzer prints periodic status lines showing the corpus size, coverage, and execution speed:
+
+\begin{lstlisting}[caption={Typical libFuzzer output during a fuzzing run.}]
+#524288  pulse  cov: 847  ft: 3291  corp: 312/18Kb
+    exec/s: 43691  rss: 142Mb
+#1048576 pulse  cov: 851  ft: 3305  corp: 318/19Kb
+    exec/s: 41942  rss: 142Mb
+\end{lstlisting}
+
+Here, \texttt{cov: 851} means 851 unique coverage edges have been discovered, \texttt{corp: 318} means 318 inputs are in the corpus, and \texttt{exec/s: 41942} means 41,942 executions per second. The campaign across all 36 targets executed approximately 141 million iterations total.
+
+\subsection{AddressSanitizer and catch\_unwind}
+
+\marginnote{\emph{ASAN:} AddressSanitizer, a memory error detector that instruments memory accesses at compile time.}%
+By default, \texttt{cargo-fuzz} enables AddressSanitizer (ASAN), which detects memory errors such as out-of-bounds access, use-after-free, and stack buffer overflow. In C/C++, ASAN is essential. In Rust, safe code cannot trigger these errors, but ASAN still catches issues in \texttt{unsafe} blocks and in the fuzzing infrastructure itself.
+
+However, ASAN introduces a subtle problem: it installs its own signal handlers, which intercept panics before Rust's unwinding mechanism can catch them. This means \texttt{std::panic::catch\_unwind} becomes unreliable---a panic inside \texttt{catch\_unwind} may be intercepted by ASAN and treated as a fatal error, aborting the process instead of returning \texttt{Err}.
+
+\begin{notebox}
+The interaction between ASAN and \texttt{catch\_unwind} forced a design decision in our harnesses. The natural approach for handling known bugs is to wrap the target call in \texttt{catch\_unwind} and ignore the panic. But with ASAN enabled, this does not work. Instead, we filter known-bug inputs \emph{before} they reach the target function, using a guard at the top of the harness that checks for known-crashing input patterns and returns early. For example, the \texttt{fuzz\_stored\_blocks} target checks whether \texttt{kv\_block\_size == 0} or whether \texttt{token\_ids} is too short, and returns before calling \texttt{create\_stored\_blocks}---because both conditions trigger known panics (Bugs~\#4 and~\#15).
+\end{notebox}
+
+\begin{whynotbox}{Why not fuzz in release mode?}
+Since production runs in release mode, why not fuzz in release mode to find exactly the bugs that users will hit? Two reasons. First, release mode suppresses integer overflow panics---the overflow silently wraps to an incorrect value instead of crashing. This means the fuzzer \emph{cannot detect} overflow bugs in release mode; they slip through as silent data corruption rather than crashes. Debug mode makes these bugs visible by turning overflows into panics. Second, release mode enables compiler optimizations that can mask undefined-behavior-adjacent patterns and make crash artifacts harder to reproduce. The correct strategy (which we followed) is to fuzz in debug mode to catch the widest class of bugs, then separately evaluate whether each bug also manifests in release mode. The TwoPartCodec overflow (Bug~\#3 in Chapter~\ref{ch:findings}) is the canonical example: the fuzzer found it as a debug-mode panic, and manual analysis revealed the release-mode silent wraparound was actually \emph{worse}---a security vulnerability.
+\end{whynotbox}
+
+\subsection{Coverage Measurement}
+
+After fuzzing, we measured which lines of source code the fuzzer's corpus actually reached, using LLVM's source-based coverage tooling. The script \texttt{scripts/fuzz-coverage.sh} automates this:
+
+\begin{lstlisting}[language=bash,caption={Generating a coverage report for a single target.}]
+./scripts/fuzz-coverage.sh kv-router fuzz_radix_tree_events
+\end{lstlisting}
+
+The script performs three steps: (1) run \texttt{cargo fuzz coverage} to replay all corpus inputs through an instrumented binary, producing raw profile data (\texttt{.profraw} files), (2) merge the profiles with \texttt{llvm-profdata merge}, and (3) generate an HTML report with \texttt{llvm-cov show}. The report highlights each source line with its execution count, making it easy to identify uncovered code.
+
+Coverage analysis revealed several blind spots in our campaign:
+\begin{itemize}
+  \item The Harmony parser had 0\% coverage because it requires an async tokenizer that cannot be called from a synchronous fuzz harness.
+  \item DeepSeek v3/v3.1 had near-0\% coverage from generic targets because they require specific configuration to activate their code paths (addressed by the dedicated \texttt{fuzz\_deepseek\_variants} target).
+  \item The \texttt{visit\_map} deserialization path in \texttt{zmq\_wire.rs} had 0\% coverage because the fuzzer only produced sequence-format MessagePack, never map-format.
+  \item Time-dependent scheduling code (\texttt{sequences/single.rs}, \texttt{sequences/multi\_worker.rs}) had 0\% coverage because it depends on wall-clock time, violating the determinism criterion.
+\end{itemize}
+
+\subsection{Crash Triage}
+
+When libFuzzer finds a crashing input, it writes the input to the \texttt{artifacts/} directory. Reproducing the crash is a single command:
+
+\begin{lstlisting}[language=bash,caption={Reproducing a crash from a saved artifact.}]
+cargo +nightly fuzz run fuzz_triple_differential \
+    artifacts/fuzz_triple_differential/crash-f79bf578...
+\end{lstlisting}
+
+Each crash was triaged by: (1) reproducing it, (2) reading the panic message and backtrace, (3) identifying the root cause in the source code, and (4) writing a bug report in the \texttt{issues/} directory. The bug reports include minimal reproduction steps, the exact code location, the root cause analysis, and a suggested fix. For example, the TwoPartCodec overflow was traced to line 58 of \texttt{two\_part.rs}, where unchecked \texttt{u64} addition overflows before the \texttt{max\_message\_size} safety check can intervene.
+
+\begin{bugbox}
+\textbf{TwoPartCodec Integer Overflow.} The decoder reads \texttt{header\_len} and \texttt{body\_len} as \texttt{u64}, then computes \texttt{24 + header\_len + body\_len} without checked arithmetic. When both lengths are near \texttt{u64::MAX}, the addition overflows and panics---a denial-of-service vector exploitable by sending 24 bytes of crafted data to any network-facing service using this codec. The \texttt{max\_message\_size} safety check occurs \emph{after} the overflow, so it cannot prevent the crash. Fix: use \texttt{checked\_add}. Found by \texttt{fuzz\_codec\_crash\_oracle}.
+\end{bugbox}
+
+
+\section{Summary}
+
+\begin{itemize}
+  \item \textbf{Fuzzing} automates input generation to discover bugs that hand-written tests miss, particularly edge cases in the vast input space.
+  \item \textbf{Coverage-guided fuzzing} uses code coverage feedback to evolve a corpus of inputs toward comprehensive path exploration. LibFuzzer instruments control-flow edges and keeps inputs that reach new code.
+  \item The \textbf{oracle problem}---determining whether output is correct---is the central challenge. We used crash, differential, property, and assertion oracles.
+  \item \textbf{Structured fuzzing} with \texttt{Arbitrary} generates typed, valid-by-construction inputs, dramatically improving the fraction of useful test executions.
+  \item \textbf{Differential testing} compares streaming vs.\ oneshot, \texttt{RadixTree} vs.\ \texttt{PositionalIndexer}, and repeated executions to catch semantic bugs invisible to crash oracles alone.
+  \item The campaign used \textbf{36 targets} across 4 crates, executing \textbf{141 million iterations} and finding \textbf{16 bugs}.
+  \item \textbf{Infrastructure details matter}: ASAN overrides \texttt{catch\_unwind}, requiring known-bug filtering instead of exception catching. Coverage reports reveal blind spots that guide target design.
+\end{itemize}
+
+\bigskip
+\begin{center}\rule{0.5\linewidth}{0.4pt}\end{center}
+\bigskip
+
+The methodology is established. The next chapter catalogs the results: what we found, why it matters, and what it teaches about the strengths and limitations of different testing approaches.
+
+\bigskip
+\noindent\textbf{Check Your Understanding}
+
+\medskip
+\noindent\emph{These questions are answerable from this chapter alone.}
+
+\begin{enumerate}
+  \item Why is coverage-guided fuzzing more effective than purely random fuzzing? What role does the corpus play?
+
+  \emph{Answer:} Random fuzzing generates inputs that mostly exercise the same early code paths (validation, error returns). Coverage-guided fuzzing uses compiler instrumentation to detect when an input reaches previously unexplored code. Such inputs are saved to the corpus and mutated further, creating an evolutionary feedback loop that drives exploration toward deeper code paths. The corpus is the fuzzer's memory---a growing collection of inputs that collectively maximize code coverage, from which new mutations are derived.
+
+  \item Explain the oracle problem. Why can a fuzzer easily detect crash bugs but not logic bugs?
+
+  \emph{Answer:} The oracle problem is the challenge of determining whether a program's output is correct for a given input. Crashes are self-announcing: the program aborts, and the fuzzer records the input. Logic bugs produce structurally valid but semantically wrong output. The fuzzer has no built-in notion of ``correct output''---it needs an external oracle (differential comparison, property assertion, or human specification) to detect semantic errors. This is why 4 of the 16 bugs required code audit rather than fuzzing.
+
+  \item How does the \texttt{Arbitrary} trait bridge the gap between the fuzzer's raw byte mutations and the target's typed input expectations?
+
+  \emph{Answer:} \texttt{Arbitrary} defines a mapping from an unstructured byte stream to a structured Rust type (structs, enums, \texttt{Vec}s). The derive macro generates this mapping automatically. The fuzzer mutates raw bytes, but these bytes are interpreted as fields of the target type. A byte flip might change a worker ID, alter a hash value, or change an enum variant---all semantically meaningful mutations. Without \texttt{Arbitrary}, the harness author must write manual byte-parsing code, and the fuzzer wastes effort generating inputs that fail early validation.
+
+  \item What is differential testing? Describe two forms used in the Dynamo campaign.
+
+  \emph{Answer:} Differential testing runs two or more implementations on the same input and compares outputs; a disagreement reveals a bug in at least one implementation. (1) The triple differential target runs \texttt{RadixTree}, \texttt{ConcurrentRadixTree}, and \texttt{PositionalIndexer} on identical operation sequences and asserts score equality---this found the RadixTree score underreporting bug. (2) The parser streaming differential runs the oneshot and streaming parsers on the same text with various chunking strategies, asserting that both produce identical reasoning and normal text---this found the Granite streaming mismatch bug.
+
+  \item Why were 4 of the 16 bugs found by code audit rather than fuzzing? What property of those bugs makes them invisible to the fuzzer's oracles?
+
+  \emph{Answer:} Those bugs are logic errors where the program runs to completion and produces output that is structurally valid but semantically wrong (e.g., silently dropping a parameter, caching a stale regex, leaking a prefix into output). The fuzzer's crash oracle only detects panics. Detecting these bugs requires knowing what the \emph{correct} output should be, which requires either a reference implementation (differential oracle) or an explicit specification encoded as assertions. When neither exists for a particular behavior, only a human reading the code and specification can spot the discrepancy.
+
+  \item The campaign filters known-bug inputs rather than using \texttt{catch\_unwind}. Why is \texttt{catch\_unwind} unreliable when AddressSanitizer is enabled?
+
+  \emph{Answer:} AddressSanitizer installs its own signal handlers that intercept panics (which are implemented as unwinding through stack frames) before Rust's panic-catching mechanism can intervene. When a panic occurs inside \texttt{catch\_unwind} with ASAN enabled, ASAN treats it as a fatal error and aborts the process, bypassing the \texttt{Err} return path of \texttt{catch\_unwind}. The workaround is to check for known-crashing input patterns at the top of the harness and return early, preventing the panic from occurring in the first place.
+
+  \item Describe the role of the \texttt{StreamingChunker} in the parser differential target. Why does chunk size matter?
+
+  \emph{Answer:} The \texttt{StreamingChunker} splits input text into chunks using one of four strategies (single byte, pseudorandom length, medium fixed-size, or entire text), controlled by a byte from the fuzzer. This tests that the streaming parser produces identical output regardless of how the input is chunked---a correctness property that holds when the parser's state machine correctly handles tokens split across chunk boundaries. The Granite streaming mismatch was caused by reasoning markers being split across chunks, which the streaming parser failed to reassemble correctly.
+
+  \item What are the three criteria used to select which Dynamo components to fuzz? Name one component that was excluded and explain why.
+
+  \emph{Answer:} The three criteria are: (1) pure Rust with no async runtime requirement, (2) deterministic behavior (same input always produces same output), and (3) accepts structured input that can be generated via \texttt{Arbitrary} or manual byte parsing. The Harmony parser was excluded because it requires an async tokenizer that cannot be called from a synchronous fuzz harness. The Kubernetes operator was excluded because it is written in Go and requires external state. Time-dependent scheduling code was excluded because it depends on wall-clock time, violating the determinism criterion.
+\end{enumerate}

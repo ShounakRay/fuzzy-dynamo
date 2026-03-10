@@ -1,0 +1,502 @@
+\chapter{Token Blocks and Memory Management}
+\label{ch:tokens}
+
+The router (Chapter~\ref{ch:kvrouter}) makes decisions based on block hashes, and the KV cache (Chapter~\ref{ch:kvcache}) is managed in fixed-size blocks. But how exactly are raw token sequences partitioned into blocks? How are those blocks hashed in a way that respects positional encoding? And how does the system track a block's lifecycle---from allocation through active use to eviction---without runtime errors? This chapter answers all three questions, introducing the \texttt{lib/tokens} crate that underpins Dynamo's cache management.
+
+
+\section{From Tokens to Blocks}
+\label{sec:tokens:blocking}
+
+\marginnote{\emph{Token:} a 32-bit unsigned integer (\texttt{u32}) representing a sub-word piece produced by the tokenizer. Dynamo defines \texttt{type Token = u32;} at the crate root.}%
+When a user's prompt arrives at the inference system, it has already been converted by a tokenizer into a sequence of integer token IDs. A prompt like ``Explain quantum entanglement'' might become the sequence $[849, 9450, 29575, 875, 4618, 358]$---six integers, each encoding a sub-word piece. The system must now decide how to manage these tokens in memory.
+
+The naive approach is to treat each token individually: one hash per token, one cache entry per token, one radix tree node per token. For a 4,096-token prompt, this means 4,096 hash computations, 4,096 radix tree lookups, and 4,096 cache entries. The overhead is enormous relative to the actual work of storing a few kilobytes of KV cache data.
+
+\begin{whynotbox}{Why not hash each token individually?}
+At first glance, per-token hashing seems like the most precise approach: any two requests that share even a single common token could reuse its cached KV entry. But the costs are prohibitive. Consider a 4,096-token prompt with block size $B = 16$:
+
+\medskip
+\begin{tabular}{lrr}
+\textbf{Metric} & \textbf{Per-token} & \textbf{Per-block ($B{=}16$)} \\
+\hline
+Hash computations & 4,096 & 256 \\
+Radix tree nodes & 4,096 & 256 \\
+Tree lookup depth & 4,096 & 256 \\
+Memory overhead per entry & $\sim$40 bytes & $\sim$40 bytes \\
+Total tree overhead & 160 KB & 10 KB \\
+\end{tabular}
+\medskip
+
+Blocking reduces every dimension of overhead by a factor of $B$. The tradeoff is granularity: if two requests diverge at token 20, the first full block (tokens 0--15) is shared, but tokens 16--19 cannot be---they belong to a block that differs overall. In practice, shared prefixes (system prompts, few-shot examples) are much longer than $B$, so this waste is negligible. The $16\times$ reduction in tree size and lookup cost far outweighs the occasional loss of a few tokens' worth of sharing.
+\end{whynotbox}
+
+\marginnote{\emph{Block size $B$:} the fixed number of tokens per block, typically 16 or 32. A tunable parameter that trades granularity for overhead.}%
+Dynamo instead groups tokens into fixed-size \emph{blocks} of $B$ tokens each. A token sequence of length $n$ is partitioned into $\lceil n / B \rceil$ blocks, where $B$ is the block size. Each block holds exactly $B$ token IDs, except possibly the last block, which may be partial. For example, with $B = 16$ and a sequence of 50 tokens, the result is 4 blocks: three full blocks of 16 tokens and one partial block of 2 tokens.
+
+In code, the \texttt{TokenBlockSequence} type manages this partitioning. Its constructor immediately splits the input into completed blocks and a trailing partial block:
+
+\begin{verbatim}
+pub fn split_tokens(
+    tokens: &[Token],
+    block_size: u32,
+    salt_hash: u64,
+) -> (Vec<TokenBlock>, PartialTokenBlock) {
+    assert!(block_size > 0, "block_size must be greater than 0");
+    let chunks: Vec<TokenBlockChunk> = tokens
+        .chunks_exact(block_size as usize)
+        .map(|chunk| TokenBlockChunk::from_tokens(chunk, salt_hash))
+        .collect();
+    // ... sequential hash chaining, then handle remainder ...
+}
+\end{verbatim}
+
+The call to \texttt{chunks\_exact} splits the token slice into groups of exactly \texttt{block\_size}; the remainder (if any) becomes the initial contents of a \texttt{PartialTokenBlock}. Notice the \texttt{assert!} on the first line---we will return to this shortly.
+
+The block size $B$ is a critical tuning parameter. A smaller $B$ gives finer-grained cache sharing (two requests that diverge at token 20 can share the first block but differ in the second), but increases the number of blocks the radix tree must track and the overhead of block-level operations. A larger $B$ reduces overhead but wastes cache when requests diverge mid-block. Production deployments typically use $B \in \{16, 32\}$, balancing granularity against overhead.
+
+\subsection{Partial Blocks}
+
+Partial blocks (the trailing block when $n$ is not a multiple of $B$) require special handling. They cannot be committed as full \texttt{TokenBlock}s until all $B$ tokens are known. Dynamo represents them with a distinct type, \texttt{PartialTokenBlock}, that accumulates tokens one at a time. When the partial block reaches capacity, it is \emph{committed} into a full \texttt{TokenBlock} and a fresh empty partial block takes its place:
+
+\begin{verbatim}
+pub fn commit(&mut self) -> Result<TokenBlock, TokenBlockError> {
+    if self.tokens.0.len() != self.block_size as usize {
+        return Err(TokenBlockError::Incomplete);
+    }
+    let tokens = std::mem::take(&mut self.tokens);
+    let chunk = TokenBlockChunk::new(tokens, self.salt_hash);
+    let block = TokenBlock::from_chunk(
+        chunk, self.parent_sequence_hash, self.position
+    );
+    self.parent_sequence_hash = Some(block.sequence_hash());
+    self.position += 1;
+    Ok(block)
+}
+\end{verbatim}
+
+The use of \texttt{std::mem::take} is idiomatic Rust: it moves the token vector out of \texttt{self.tokens} and replaces it with an empty default, avoiding a clone. After committing, the partial block resets itself to represent the \emph{next} position in the sequence, inheriting the sequence hash of the block just created as its parent. This chaining is the foundation of the hashing scheme described in the next section.
+
+\begin{notebox}
+The division $\lceil n/B \rceil$ appears throughout the codebase---in \texttt{split\_tokens}, in truncation logic, in the router's block counting. If $B = 0$ (due to misconfiguration or a default value propagating incorrectly), every one of these divisions panics. The \texttt{assert!(block\_size > 0)} in \texttt{split\_tokens} catches this early, but not all call sites are equally disciplined. In Chapter~\ref{ch:findings}, we document a \texttt{div\_ceil(block\_size)} panic in the router's \texttt{selector.rs} (line 113) and another in \texttt{to\_block\_level()} that our fuzzer triggered with \texttt{block\_size = 0}.
+\end{notebox}
+
+\bigskip
+We now have a sequence of fixed-size blocks, each containing $B$ token IDs. The next step is to give each block a unique identity---a hash that the radix tree can use for cache lookups. But as we will see, a simple content hash is not enough.
+
+
+\section{Positional Block Hashing}
+\label{sec:tokens:hashing}
+
+Each block must be hashed in a way that captures both its \emph{content} (the token IDs) and its \emph{position} (where in the sequence the block starts). Two blocks with identical tokens at different positions must produce different hashes, because their KV cache entries differ due to positional encoding (Chapter~\ref{ch:transformer}).
+
+\marginnote{\emph{xxHash:} a non-cryptographic hash function optimized for speed. Dynamo uses the XXH3 variant from the \texttt{xxhash-rust} crate.}%
+Dynamo implements this as a multi-stage hash chain. The hash function itself is straightforward:
+
+\begin{verbatim}
+pub fn compute_hash_v2(data: &[u8], seed: u64) -> u64 {
+    xxhash_rust::xxh3::xxh3_64_with_seed(data, seed)
+}
+\end{verbatim}
+
+XXH3 is a non-cryptographic hash function designed for speed (tens of GB/s on modern CPUs). It accepts arbitrary byte data and a 64-bit seed. Dynamo uses it to build three progressively richer hash types.
+
+\subsection{The Three Hash Layers}
+
+\textbf{Layer 1: Salt Hash.}\hspace{1em} Before any tokens are hashed, the system computes a \texttt{SaltHash} from model metadata---architecture identifier, weight checksums, PEFT adapter information. This salt ensures that the same prompt tokenized for two different models produces entirely different block hashes, preventing cross-model cache pollution.
+
+\textbf{Layer 2: Block Hash.}\hspace{1em} Each block's tokens are hashed using the salt hash as the seed. The \texttt{TokenBlockChunk} type computes this immediately upon construction:
+
+\begin{verbatim}
+fn new(tokens: Tokens, salt_hash: SaltHash) -> Self {
+    let block_hash = compute_hash_v2(
+        cast_slice(&tokens), salt_hash
+    );
+    Self { tokens, salt_hash, block_hash }
+}
+\end{verbatim}
+
+The \texttt{cast\_slice} call (from the \texttt{bytemuck} crate) reinterprets the \texttt{\&[u32]} token slice as \texttt{\&[u8]} without copying---a zero-cost transmutation that the type system verifies is safe because \texttt{u32} implements \texttt{Pod} (plain-old-data).
+
+\textbf{Layer 3: Sequence Hash.}\hspace{1em} The block hash alone is content-addressable but position-blind. The \emph{sequence hash} incorporates position by chaining: each block's sequence hash is computed from \emph{both} the parent block's sequence hash and the current block hash:
+
+\begin{verbatim}
+let sequence_hash = match parent_sequence_hash {
+    Some(parent) => compute_hash_v2(
+        cast_slice(&[parent, chunk.block_hash]),
+        chunk.salt_hash,
+    ),
+    None => chunk.block_hash, // First block: no parent
+};
+\end{verbatim}
+
+This chaining means that the same tokens ``Hello world'' at position 0 produce a different sequence hash than the same tokens at position 8, because the parent chain is different. The first block's sequence hash equals its block hash (no parent to chain with), and every subsequent block folds in all prior history.
+
+\begin{insightbox}
+Positional hashing is what makes prefix sharing correct. When two requests share a common prefix, their blocks are not just content-identical---they are also position-identical (both start from position 0). Their sequence hashes match at every position in the shared prefix. If the same tokens appeared at different positions in different requests, the hash chain would diverge, and no (incorrect) sharing would occur.
+\end{insightbox}
+
+\bigskip
+Let us trace a concrete example through all three layers to see how they interact. Figure~\ref{fig:hash-pipeline} walks through the hashing of a 3-block token sequence, showing how the salt propagates into every block hash and how the sequence hash chains blocks together.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    node distance=0.6cm,
+    box/.style={draw, rounded corners=3pt, minimum height=0.7cm, font=\small},
+    hashbox/.style={draw, rounded corners=3pt, minimum height=0.6cm, fill=blue!12, font=\footnotesize},
+    seqbox/.style={draw, rounded corners=3pt, minimum height=0.6cm, fill=green!15, font=\footnotesize},
+    saltbox/.style={draw, rounded corners=3pt, minimum height=0.6cm, fill=yellow!25, font=\footnotesize},
+    tokenbox/.style={draw, rounded corners=3pt, minimum height=0.6cm, fill=gray!12, font=\footnotesize},
+    arrow/.style={-{Stealth[length=5pt]}, thick},
+    dasharrow/.style={-{Stealth[length=5pt]}, thick, dashed},
+    lbl/.style={font=\scriptsize, text=black!70}
+  ]
+
+  % Layer 1: Salt
+  \node[saltbox, minimum width=3.5cm] (salt) {\textbf{Salt Hash:} \texttt{0xa3f1...} (from model metadata)};
+  \node[lbl, left=0.2cm of salt] {\textbf{Layer 1}};
+
+  % Token blocks
+  \node[tokenbox, below=1.0cm of salt, xshift=-4.2cm, minimum width=2.8cm] (t0) {Block 0: $[849, 9450, \ldots]$};
+  \node[tokenbox, right=0.4cm of t0, minimum width=2.8cm] (t1) {Block 1: $[2917, 441, \ldots]$};
+  \node[tokenbox, right=0.4cm of t1, minimum width=2.8cm] (t2) {Block 2: $[7103, 558, \ldots]$};
+
+  % Layer 2: Block hashes
+  \node[hashbox, below=0.6cm of t0, minimum width=2.8cm] (bh0) {BH\textsubscript{0} = \texttt{0x7e2b...}};
+  \node[hashbox, below=0.6cm of t1, minimum width=2.8cm] (bh1) {BH\textsubscript{1} = \texttt{0x1d4f...}};
+  \node[hashbox, below=0.6cm of t2, minimum width=2.8cm] (bh2) {BH\textsubscript{2} = \texttt{0x93a8...}};
+  \node[lbl, left=0.2cm of bh0] {\textbf{Layer 2}};
+
+  % Arrows: salt -> block hashes (seed)
+  \draw[dasharrow, black!50] (salt.south) -- ++(0,-0.25) -| (bh0.north) node[pos=0.25, above, lbl] {seed};
+  \draw[dasharrow, black!50] (salt.south) -- ++(0,-0.25) -| (bh1.north);
+  \draw[dasharrow, black!50] (salt.south) -- ++(0,-0.25) -| (bh2.north);
+
+  % Arrows: tokens -> block hashes (data)
+  \draw[arrow] (t0) -- (bh0);
+  \draw[arrow] (t1) -- (bh1);
+  \draw[arrow] (t2) -- (bh2);
+
+  % Layer 3: Sequence hashes
+  \node[seqbox, below=0.8cm of bh0, minimum width=2.8cm] (sh0) {SH\textsubscript{0} = BH\textsubscript{0}};
+  \node[seqbox, below=0.8cm of bh1, minimum width=2.8cm] (sh1) {SH\textsubscript{1} = \texttt{0x5c71...}};
+  \node[seqbox, below=0.8cm of bh2, minimum width=2.8cm] (sh2) {SH\textsubscript{2} = \texttt{0xe0f6...}};
+  \node[lbl, left=0.2cm of sh0] {\textbf{Layer 3}};
+
+  % Arrows: block hash -> sequence hash
+  \draw[arrow] (bh0) -- (sh0);
+  \draw[arrow] (bh1) -- (sh1);
+  \draw[arrow] (bh2) -- (sh2);
+
+  % Arrows: chain (sequence hash of previous feeds into next)
+  \draw[arrow, red!60!black] (sh0.east) -- (sh1.west) node[midway, above, lbl, text=red!60!black] {chain};
+  \draw[arrow, red!60!black] (sh1.east) -- (sh2.west) node[midway, above, lbl, text=red!60!black] {chain};
+
+  % Annotation: first block special case
+  \node[lbl, below=0.15cm of sh0, text=black!60] {(no parent)};
+
+  % Annotation: formula for SH_1
+  \node[lbl, below=0.15cm of sh1, text=black!60, align=center] {$\texttt{xxh3}([\text{SH}_0, \text{BH}_1],\; \text{salt})$};
+
+  % Annotation: formula for SH_2
+  \node[lbl, below=0.15cm of sh2, text=black!60, align=center] {$\texttt{xxh3}([\text{SH}_1, \text{BH}_2],\; \text{salt})$};
+
+\end{tikzpicture}
+\caption{The three-layer hashing pipeline for a 3-block token sequence. Layer~1 (salt) derives a seed from model metadata. Layer~2 hashes each block's tokens independently using the salt as seed, producing content-addressable block hashes (BH). Layer~3 chains each block hash with its predecessor's sequence hash (SH), incorporating positional context. The first block's sequence hash equals its block hash; subsequent blocks fold in all prior history via the red chain arrows.}
+\label{fig:hash-pipeline}
+\end{figure}
+
+\bigskip
+With the three-layer scheme producing 64-bit sequence hashes, the next question is how to pack these hashes---along with position and content information---into a single lookup key for the radix tree.
+
+\subsection{The 128-Bit Positional Sequence Hash}
+
+\marginnote{\emph{Bit packing:} encoding multiple values into the sub-fields of a single integer, using bit shifts and masks to extract components. A common systems technique for reducing memory per entry.}%
+The 64-bit sequence hash captures prefix history but does not explicitly encode the block's position or its content hash as separately queryable fields. For the radix tree, Dynamo needs all three in a single lookup key. The \texttt{PositionalSequenceHash} packs them into 128 bits using a variable-width encoding:
+
+\begin{verbatim}
+pub struct PositionalSequenceHash(u128);
+// Layout of upper 64 bits:
+//   [mode (2 bits)][position (P bits)][local_block_hash (R bits)]
+// Lower 64 bits: SequenceHash
+//
+// Modes (auto-selected based on position):
+//   Mode 00: 8-bit position + 54-bit LBH
+//   Mode 01: 16-bit position + 46-bit LBH
+//   Mode 10: 24-bit position + 38-bit LBH
+//   Mode 11: 31-bit position + 31-bit LBH
+\end{verbatim}
+
+The mode is selected automatically based on the position value, using the smallest representation that fits. Most sequences have fewer than 256 blocks (mode 0), giving 54 bits for the local block hash---more than enough for near-zero collision probability at practical scale. For exceptionally long sequences (positions up to $2^{31} - 1$), mode 3 trades block hash precision for position range.
+
+\begin{whynotbox}{Why a 128-bit packed hash instead of three separate fields?}
+The radix tree (Chapter~\ref{ch:kvrouter}) uses a \texttt{DashMap<K, V>} keyed by block hash. Each lookup involves hashing the key, probing the table, and comparing keys for equality. If the key were a struct with three separate 64-bit fields (sequence hash, block hash, position), each lookup would hash $3 \times 8 = 24$ bytes and compare 24 bytes on each probe. The 128-bit packed representation halves both costs to 16 bytes.
+
+More importantly, a struct-of-fields invites partial use: a programmer might accidentally compare only the sequence hash, forgetting that two blocks at the same position in different sequences could (with low probability) collide on sequence hash alone. By packing everything into a single opaque \texttt{u128}, the type makes partial comparison impossible---equality checks always consider all three components. The variable-width mode encoding is the price of this safety: it adds a few bit-shift operations per encode/decode, but these are trivially cheap compared to the hash table probe they accompany.
+\end{whynotbox}
+
+The encoding and decoding use straightforward bit manipulation:
+
+\begin{verbatim}
+fn encode_upper(mode: u8, position: u64,
+                local_block_hash: u64) -> u64 {
+    let (position_bits, lbh_bits) = match mode {
+        0 => (8, 54), 1 => (16, 46),
+        2 => (24, 38), 3 => (31, 31),
+        _ => unreachable!(),
+    };
+    let position_mask = (1u64 << position_bits) - 1;
+    let lbh_mask = (1u64 << lbh_bits) - 1;
+    ((mode as u64) << 62)
+        | ((position & position_mask) << lbh_bits)
+        | (local_block_hash & lbh_mask)
+}
+\end{verbatim}
+
+\subsection{Lineage Hashing for Tree Traversal}
+
+The \texttt{PositionalSequenceHash} enables forward lookups---given a sequence, find which worker has its blocks cached. But the radix tree also needs \emph{backward traversal}: given a block at position $k$, find its parent at position $k - 1$. The \texttt{PositionalLineageHash} encodes both the current block's sequence hash fragment and the parent's:
+
+\begin{verbatim}
+pub struct PositionalLineageHash(u128);
+// Layout: [mode (2)][position (P)][parent_frag (M)][current_frag (N)]
+// Mode 00: 8-bit pos + 59-bit parent + 59-bit current
+// Mode 01: 16-bit pos + 55-bit parent + 55-bit current
+// Mode 10: 24-bit pos + 51-bit parent + 51-bit current
+\end{verbatim}
+
+A subtle correctness challenge arises at mode boundaries. When position 255 (mode 0, 59-bit fragments) is the parent of position 256 (mode 1, 55-bit fragments), the parent fragment stored at position 256 has only 55 bits, while the current fragment at position 255 has 59 bits. The constructor handles this with \emph{cross-mode alignment}: it computes the fragment width available at the \emph{next} position and truncates the current hash accordingly:
+
+\begin{verbatim}
+let next_mode = Self::select_mode(position + 1);
+let (_, next_parent_bits, _) = Self::bit_layout(next_mode);
+let aligned_current_bits = current_bits.min(next_parent_bits);
+\end{verbatim}
+
+This ensures that the current fragment at position $k$ always matches the parent fragment stored at position $k + 1$, even when the two positions use different encoding modes.
+
+\begin{notebox}
+The lineage hash limits positions to $2^{24} - 1$ (about 16.7 million blocks), stricter than the sequence hash's $2^{31} - 1$ limit. At a block size of 16, this supports sequences of up to 268 million tokens---well beyond current model context windows. The constructor panics if this limit is exceeded, a deliberate design choice rather than a silent truncation.
+\end{notebox}
+
+\bigskip
+The hashing scheme gives each block a rich, position-aware identity. But hashes are only meaningful for \emph{complete} blocks---a half-filled block has no stable hash. How does Dynamo ensure that no code accidentally hashes a partial block, or mutates a block after its hash has been computed? The answer lies in Rust's type system.
+
+
+\section{The Type-State Pattern}
+\label{sec:tokens:typestate}
+
+\marginnote{\emph{Type-state pattern:} using Rust's type system to encode an object's lifecycle state, making invalid state transitions a compile-time error rather than a runtime check.}%
+Dynamo's token block system uses a carefully designed type hierarchy to enforce correct block lifecycle at compile time. While it does not use the classic generic-parameter type-state pattern (\texttt{Block<State>}), it achieves the same safety guarantees through distinct types for each lifecycle phase.
+
+\subsection{Two Types, Two Phases}
+
+A block in Dynamo exists in one of two states, represented by two entirely separate types:
+
+\begin{enumerate}
+  \item \textbf{\texttt{PartialTokenBlock}}: A block under construction. Tokens can be appended one at a time via \texttt{push\_tokens}. No hash has been computed. The block cannot be inserted into the radix tree or used for cache lookups.
+  \item \textbf{\texttt{TokenBlock}}: A completed, immutable block. All $B$ tokens are present, the block hash, sequence hash, positional sequence hash, and positional lineage hash have all been computed. The block is ready for cache insertion and prefix matching.
+\end{enumerate}
+
+The transition between states is the \texttt{commit()} method, which \emph{consumes} the partial block's token data and produces a \texttt{TokenBlock}:
+
+\begin{verbatim}
+// PartialTokenBlock -> TokenBlock (via commit)
+pub fn commit(&mut self) -> Result<TokenBlock, TokenBlockError> {
+    if self.tokens.0.len() != self.block_size as usize {
+        return Err(TokenBlockError::Incomplete);
+    }
+    let tokens = std::mem::take(&mut self.tokens);
+    let chunk = TokenBlockChunk::new(tokens, self.salt_hash);
+    let block = TokenBlock::from_chunk(
+        chunk, self.parent_sequence_hash, self.position
+    );
+    // ... reset self for next block ...
+    Ok(block)
+}
+\end{verbatim}
+
+Several design choices enforce correctness:
+
+\textbf{No \texttt{Clone} on \texttt{PartialTokenBlock}.}\hspace{1em} The \texttt{PartialTokenBlock} type deliberately omits \texttt{Clone} (the source code comments: ``No Clone: intended to be unique within a sequence''). This prevents accidentally duplicating a partial block and having two copies at different stages of completion, which would lead to hash chain corruption.
+
+\textbf{Explicit error on incomplete commit.}\hspace{1em} Calling \texttt{commit()} on a block with fewer than $B$ tokens returns \texttt{Err(TokenBlockError::Incomplete)} rather than silently padding. This forces callers to handle the partial-block case explicitly.
+
+\textbf{Immutability of \texttt{TokenBlock}.}\hspace{1em} Once created, a \texttt{TokenBlock} exposes only accessor methods (\texttt{tokens()}, \texttt{block\_hash()}, \texttt{sequence\_hash()}, etc.). There are no setters. The block's hashes are computed once in \texttt{from\_chunk} and can never be invalidated by mutation.
+
+\subsection{The Intermediate: \texttt{TokenBlockChunk}}
+
+Between \texttt{PartialTokenBlock} and \texttt{TokenBlock}, Dynamo introduces a private intermediate type:
+
+\begin{verbatim}
+struct TokenBlockChunk {
+    tokens: Tokens,
+    salt_hash: SaltHash,
+    block_hash: BlockHash,
+}
+\end{verbatim}
+
+A chunk has computed its block hash (Layer 2) but not yet its sequence hash (Layer 3), which depends on the parent block. This separation would enable parallel hash computation: all chunks in a batch can compute their block hashes independently, and only the sequential chaining step requires ordering. The \texttt{split\_tokens} function exploits this structure, computing all chunks in a batch before sequentially chaining them:
+
+\begin{verbatim}
+let chunks: Vec<TokenBlockChunk> = tokens
+    .chunks_exact(block_size as usize)
+    .map(|chunk| TokenBlockChunk::from_tokens(chunk, salt_hash))
+    .collect();
+// Sequential chaining:
+for (position, chunk) in chunks.into_iter().enumerate() {
+    let new_block = TokenBlock::from_chunk(
+        chunk, last_sequence_hash, position
+    );
+    last_sequence_hash = Some(new_block.sequence_hash());
+    result_blocks.push(new_block);
+}
+\end{verbatim}
+
+\subsection{Partial Blocks in the UniqueBlock Enum}
+
+For the broader system (beyond the tokens crate), blocks are identified via the \texttt{UniqueBlock} enum:
+
+\begin{verbatim}
+pub enum UniqueBlock {
+    PartialBlock(Uuid),    // Identified by UUID (incomplete)
+    FullBlock(GlobalHash), // Identified by hash (complete)
+}
+\end{verbatim}
+
+Partial blocks cannot be content-addressed (their hash is not yet known), so they receive a random UUID. Full blocks are identified by their deterministic hash. This enum prevents the system from accidentally looking up a partial block by hash---the type makes the two identification schemes mutually exclusive.
+
+\begin{insightbox}
+The type-state pattern is a zero-cost abstraction: the state distinctions exist only at compile time and are erased during code generation. At runtime, the compiler generates the same machine code it would for a single \texttt{struct} with no state tracking. The safety guarantees---no hashing a partial block, no mutating a committed block, no cloning an in-progress block---come entirely from the compiler, with zero runtime overhead.
+\end{insightbox}
+
+\bigskip
+The type system ensures that blocks are constructed correctly. But correctness at creation time is only half the story---blocks must also be managed correctly throughout their entire lifetime in the system, from arrival through sharing to eventual eviction.
+
+
+\section{Memory Lifecycle}
+\label{sec:tokens:lifecycle}
+
+With the type system enforcing block correctness, we can now trace the full lifecycle of a token block through the system---from the moment a request arrives to the moment the block's memory is reclaimed.
+
+\subsection{Phase 1: Arrival and Blocking}
+
+When a request arrives, the frontend tokenizes the prompt and constructs a \texttt{TokenBlockSequence}:
+
+\begin{verbatim}
+let seq = TokenBlockSequence::new(tokens, block_size, Some(salt_hash));
+\end{verbatim}
+
+This immediately splits the tokens into complete \texttt{TokenBlock}s and a trailing \texttt{PartialTokenBlock}. Each complete block has its full hash chain computed. The sequence is now ready for routing.
+
+\subsection{Phase 2: Routing via Hash Lookup}
+
+The router (Chapter~\ref{ch:kvrouter}) takes the completed blocks' \texttt{PositionalSequenceHash} values and queries the \texttt{PositionalRadixTree}---a two-level \texttt{DashMap} indexed first by position, then by hash:
+
+\begin{verbatim}
+pub struct PositionalRadixTree<V, K = PositionalSequenceHash>
+where K: PositionalHash + Hash + Eq + Clone,
+{
+    map: DashMap<u64, DashMap<K, V>>,
+}
+\end{verbatim}
+
+The outer map partitions entries by block position. The inner map stores hash-to-value mappings for all blocks at that position. This two-level structure enables efficient prefix matching: the router iterates from position 0 upward, checking each block's hash against the tree, until it finds the longest matching prefix. The worker with the most cached blocks is selected.
+
+\subsection{Phase 3: Prefill and Decode}
+
+The selected worker receives the token sequence. During \emph{prefill}, the worker processes all prompt tokens through the transformer's attention layers, producing KV cache entries for each block. These entries are stored in GPU memory in block-sized slots---one slot per \texttt{TokenBlock}.
+
+During \emph{decode} (autoregressive generation), each new token is appended to the sequence via \texttt{append()}:
+
+\begin{verbatim}
+pub fn append(&mut self, token: Token)
+    -> Result<Option<usize>, TokenBlockError>
+\end{verbatim}
+
+If the new token completes a block (fills the partial block to $B$ tokens), the block is committed, its hashes are computed, and the method returns \texttt{Ok(Some(index))} with the index of the newly completed block. The system can then insert this block's hash into the radix tree, making it available for future requests to share.
+
+\subsection{Phase 4: Sharing via Prefix Matching}
+
+When a subsequent request arrives with a partially overlapping prefix, the router finds the matching blocks in the radix tree and routes the request to the worker that already has them cached. The new request skips prefill for the shared blocks and only processes the divergent suffix. This is the core mechanism of KV-cache-aware routing (Chapter~\ref{ch:kvrouter}).
+
+The sharing is safe because blocks are immutable after commitment. Two requests can reference the same \texttt{TokenBlock} without any risk of one modifying the other's cached data.
+
+\subsection{Phase 5: Mutation and Truncation}
+
+Real serving workloads require sequence mutation. A speculative decoding system may need to retract tokens that were incorrectly predicted. The \texttt{TokenBlockSequence} supports this through \texttt{pop}, \texttt{truncate}, and \texttt{unwind}:
+
+\begin{verbatim}
+pub fn truncate(&mut self, len: usize)
+    -> Result<(), TokenBlockError>
+pub fn unwind(&mut self, count: usize)
+    -> Result<(), TokenBlockError>
+pub fn pop(&mut self) -> Option<Token>
+\end{verbatim}
+
+Truncation is more complex than appending. If the new length falls within the current partial block, only partial-block tokens are removed. If it crosses into committed blocks, entire \texttt{TokenBlock}s must be discarded and the partial block must be reconstructed from the surviving tokens of the first affected block.
+
+\begin{bugbox}
+The truncation logic contains a defensive \texttt{block\_size.max(1)} call to prevent division by zero if \texttt{block\_size} is somehow zero despite the constructor's assertion. This belt-and-suspenders approach reflects a real concern: the \texttt{block\_size} field is a plain \texttt{u32}, not a newtype that enforces non-zero, so a bug in deserialization or configuration could bypass the constructor's check. Our fuzzer exercised this path by constructing \texttt{TokenBlockSequence} values with block sizes from 1 to 16, confirming that the truncation arithmetic is correct for all non-zero sizes. The \texttt{div\_ceil(block\_size)} pattern with zero block sizes remains a recurring vulnerability across the codebase---we found it in \texttt{selector.rs}, \texttt{protocols.rs}, and \texttt{push\_router.rs}.
+\end{bugbox}
+
+\subsection{Phase 6: Eviction}
+
+When GPU memory pressure requires reclamation, blocks are evicted. The eviction order is typically LRU (least recently used): blocks that have not been accessed by any recent request are evicted first. When a block is evicted, its hash is removed from the radix tree and its memory slot is returned to the free pool.
+
+This heuristic works well for LLM serving because popular system prompts (``You are a helpful assistant...'') are accessed frequently and remain cached, while one-off conversational turns are evicted quickly. The result is that the most valuable cache entries---those shared by the largest number of requests---naturally survive the longest.
+
+\begin{insightbox}
+The memory lifecycle mirrors OS virtual memory management: allocation from a free pool, active use with sharing (analogous to copy-on-write pages), and eviction under pressure with an LRU policy. The key addition is the hash-based sharing mechanism: where an OS deduplicates identical pages reactively (e.g., KSM in Linux), Dynamo deduplicates proactively by hashing blocks at creation time and routing new requests to workers that already hold matching blocks.
+\end{insightbox}
+
+
+\section{Summary}
+
+\begin{itemize}
+  \item Token sequences are \textbf{partitioned into fixed-size blocks} of $B$ tokens, producing $\lceil n/B \rceil$ blocks per sequence. Partial trailing blocks are tracked separately and committed only when full.
+  \item \textbf{Three-layer hashing} builds progressively richer identifiers: the \emph{salt hash} prevents cross-model collisions, the \emph{block hash} fingerprints content, and the \emph{sequence hash} chains blocks to incorporate positional context.
+  \item The \textbf{128-bit positional sequence hash} packs sequence hash, block position, and local block hash into a single key using variable-width mode encoding, enabling efficient radix tree lookups.
+  \item The \textbf{positional lineage hash} additionally encodes parent-child relationships, supporting backward traversal through the block chain with cross-mode boundary alignment.
+  \item \textbf{Distinct types} for each lifecycle phase (\texttt{PartialTokenBlock}, \texttt{TokenBlockChunk}, \texttt{TokenBlock}, \texttt{UniqueBlock}) enforce correct state transitions at compile time with zero runtime cost.
+  \item The \textbf{memory lifecycle} follows an arrive-block-route-prefill-share-evict progression, with LRU eviction naturally preserving high-value shared prefixes.
+  \item Edge cases in block arithmetic (division by zero when $B = 0$, mode boundary alignment, partial-block truncation) are a recurring source of bugs found by fuzzing.
+\end{itemize}
+
+\bigskip
+\begin{center}\rule{0.5\linewidth}{0.4pt}\end{center}
+\bigskip
+
+Blocks are now hashed, routed, and cached. But how does the data actually travel between services? The next chapter examines the binary wire format and the parsers that extract structured content from raw model output.
+
+\bigskip
+\noindent\textbf{Check Your Understanding}
+
+\medskip
+\noindent\emph{These questions are answerable from this chapter alone.}
+
+\begin{enumerate}
+  \item \textbf{Why must block hashing incorporate position, not just content?} Give a concrete example of incorrect behavior without positional hashing.
+
+  \textit{Answer:} The KV cache entries for the same tokens differ depending on where those tokens appear in the sequence, because the transformer's positional encoding (RoPE, absolute, etc.) produces different attention patterns at different positions. Without positional hashing, the tokens ``Hello world'' at position 0 and the same tokens at position 8 would produce the same hash. The radix tree would incorrectly conclude they share a cache entry, causing the system to serve stale KV values computed with the wrong positional encoding---producing garbled output. The sequence hash chain prevents this: even with identical block hashes, different parent chains yield different sequence hashes.
+
+  \item \textbf{Explain the three-layer hashing scheme.} What does each layer add, and why is it necessary?
+
+  \textit{Answer:} Layer 1 (salt hash) hashes model metadata into a seed, preventing two different models from sharing cache entries for the same prompt. Layer 2 (block hash) hashes the $B$ token IDs within a block using the salt as seed, producing a content fingerprint. Layer 3 (sequence hash) chains each block hash with its parent's sequence hash, folding positional context into the identifier. Without the salt, cross-model pollution is possible. Without the block hash, the system cannot identify content-identical blocks. Without the sequence hash, position-dependent cache entries would be incorrectly shared.
+
+  \item \textbf{What is the purpose of the variable-width mode encoding in \texttt{PositionalSequenceHash}?} Why not use a fixed layout?
+
+  \textit{Answer:} The mode encoding allocates more bits to the local block hash when positions are small (mode 0: 54 bits for LBH) and trades LBH bits for position bits as positions grow (mode 3: 31 bits each). Since most sequences have fewer than 256 blocks, mode 0 applies to the vast majority of blocks, giving near-full 64-bit hash precision. A fixed 31-bit position field would waste 23 bits on every short-sequence block, reducing hash precision and increasing collision probability in the common case.
+
+  \item \textbf{Why does \texttt{PartialTokenBlock} deliberately omit the \texttt{Clone} trait?}
+
+  \textit{Answer:} A \texttt{PartialTokenBlock} represents a unique, in-progress accumulation point within a \texttt{TokenBlockSequence}. If it could be cloned, two copies could be filled independently, each computing different hashes when committed. The sequence hash chain requires a single linear progression---block $k$'s parent hash must be block $k-1$'s sequence hash. A cloned partial block would fork this chain, producing blocks with inconsistent ancestry. Omitting \texttt{Clone} makes this bug a compile-time error.
+
+  \item \textbf{How does the lineage hash handle mode boundaries?} Why is cross-mode alignment necessary?
+
+  \textit{Answer:} At position 255 (mode 0), the current hash fragment uses 59 bits. At position 256 (mode 1), the parent hash fragment uses only 55 bits. Without alignment, the parent fragment stored at position 256 would be a 55-bit truncation of a 59-bit value, and matching would fail. The constructor solves this by precomputing the next position's mode and truncating the current fragment to the minimum of the two widths: \texttt{aligned\_current\_bits = current\_bits.min(next\_parent\_bits)}. This ensures the current fragment at position $k$ is always a subset of the bits available for the parent fragment at position $k + 1$.
+
+  \item \textbf{The chapter mentions that \texttt{block\_size = 0} causes panics across the codebase.} Why is this a realistic concern in a production system rather than a purely theoretical one?
+
+  \textit{Answer:} Block size flows through multiple layers: configuration files, RPC messages, deserialization, and internal computation. A misconfigured YAML file, a zero-initialized protobuf field, or a default \texttt{u32} value (which is 0 in Rust) could propagate a zero block size past the constructor's assertion---especially in code paths that construct block-related values from deserialized network data rather than through the \texttt{TokenBlockSequence::new} constructor. Our fuzzer confirmed this by finding \texttt{div\_ceil(block\_size)} panics in three separate modules (\texttt{selector.rs}, \texttt{protocols.rs}, \texttt{push\_router.rs}), each receiving block size from a different source. Defense in depth---checking at every division site, not just the constructor---is the only reliable mitigation.
+\end{enumerate}

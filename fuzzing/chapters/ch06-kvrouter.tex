@@ -1,0 +1,579 @@
+\chapter{KV-Aware Routing and the Radix Tree}
+\label{ch:kvrouter}
+
+When a request arrives at Dynamo's router, it must answer a deceptively simple question: \emph{which GPU should handle this request?} A naive round-robin or least-loaded strategy ignores the most valuable information available---which GPU already has relevant KV cache blocks in memory. Routing a request to a GPU that has already cached 90\% of the prompt's KV data saves the compute cost of prefill for those tokens, reduces time to first token, and avoids wasting memory on duplicate cache entries. This chapter explains how Dynamo makes this decision, building from the foundational data structure (the radix tree) through the hashing scheme, cost function, and concurrency strategy.
+
+
+\section{The Routing Problem}
+\label{sec:kvrouter:problem}
+
+\marginnote{\emph{Cache hit rate:} the fraction of a request's token blocks already present in the target worker's KV cache.}%
+Consider a fleet of $W$ GPU workers serving an LLM. Each worker maintains a KV cache---a memory region storing the key and value tensors computed during previous requests' prefill phases. When a new request arrives with token sequence $[t_1, t_2, \ldots, t_n]$, the router must choose one of the $W$ workers. If the chosen worker already has KV cache entries for a prefix $[t_1, \ldots, t_k]$ of the request (from a prior request that shared the same system prompt, for instance), then only tokens $[t_{k+1}, \ldots, t_n]$ need prefill computation. The savings are proportional to $k/n$.
+
+The routing problem is a multi-objective optimization. The router must balance three competing goals:
+
+\begin{enumerate}
+  \item \textbf{Maximize KV cache reuse.} Route to the worker with the most relevant cached blocks. This minimizes prefill computation and time to first token.
+  \item \textbf{Balance load across workers.} Avoid overloading any single GPU. A worker with perfect cache overlap but a queue of 50 pending requests may be slower than a worker with zero cache overlap and an empty queue.
+  \item \textbf{Minimize latency.} Prefer workers that can start processing immediately, accounting for both cache benefit and queueing delay.
+\end{enumerate}
+
+These goals conflict: the worker with the best cache hit rate may also be the most heavily loaded. In production, many requests share the same system prompt, so without a load-balancing counterweight, all such requests would route to the same worker---creating a hotspot.
+
+\begin{insightbox}
+The routing problem reduces to a \emph{prefix matching} problem: given a new request's token blocks, find which workers have cached the longest matching prefix. The data structure that makes this efficient---the radix tree---is the subject of the next section.
+\end{insightbox}
+
+\begin{whynotbox}{Why not just use a hash table mapping requests to workers?}
+A simpler design would hash the entire prompt and look up which worker last served an identical prompt. This fails for two reasons.
+
+\textbf{Prefix sharing.} Two requests that share a 2000-token system prompt but differ in their 50-token user messages have completely different full-prompt hashes---yet 97.5\% of their KV cache is identical. A hash table sees them as unrelated; a prefix-matching structure recognizes the overlap.
+
+\textbf{Partial reuse.} Even when no worker has the \emph{complete} prefix cached, one worker may have 80\% of it. A hash table returns ``miss'' for anything less than an exact match. The radix tree returns the overlap \emph{depth} for every worker, enabling the cost function to make a graded decision.
+\end{whynotbox}
+
+Dynamo resolves the tension between cache affinity and load balancing through a \emph{cost function} that combines cache overlap with load metrics into a single scalar score per worker. The router evaluates this function for every candidate worker and selects the one with the best score. The configurable weight between these two factors is the \texttt{overlap\_score\_weight} parameter in \texttt{KvRouterConfig}, which defaults to \texttt{1.0}. Setting it to zero disables cache-aware routing entirely, reducing the router to a pure load balancer.
+
+
+\section{Tries and Radix Trees}
+\label{sec:kvrouter:trie}
+
+\marginnote{\emph{Trie:} a tree where each node represents a single element of a key, and paths from root to leaf spell out complete keys.}%
+A \emph{trie} (from ``retrieval'') is a tree-shaped data structure for storing and looking up sequences. Each node in a trie represents a single element---in our case, a single block hash. A path from the root to any node spells out a prefix of some stored sequence. Tries support efficient prefix matching: to find all sequences that share a given prefix, we simply walk the tree following the prefix elements. The lookup cost is $O(k)$ where $k$ is the length of the prefix, independent of the number of stored sequences.
+
+A \emph{radix tree} (also called a \emph{Patricia trie} or \emph{compressed trie}) optimizes the trie by merging chains of single-child nodes into single edges that carry multiple elements. If a trie has a chain of nodes $A \to B \to C$ where $B$ has only one child, the radix tree collapses this into a single edge $A \to C$ labeled with both elements. This compression reduces memory usage and speeds up traversal for keys with long unique suffixes---exactly the pattern that arises in LLM serving, where many requests share a long system prompt prefix and diverge only in the user message.
+
+To make this concrete: consider a chat application where every request begins with a 2000-token system prompt (about 125 blocks at block size 16), followed by a user message. In a plain trie, the shared prefix creates a chain of 125 single-child nodes that every lookup must traverse. In a radix tree, this chain collapses into a single edge, and the tree branches only where user messages diverge. The memory savings and traversal speedup are proportional to the length of the shared prefix.
+
+Figure~\ref{fig:radix-tree-example} illustrates this structure with a concrete example.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+    node distance=1.2cm and 2.2cm,
+    treenode/.style={circle, draw, minimum size=0.9cm, font=\footnotesize, inner sep=1pt},
+    rootnode/.style={treenode, fill=gray!20},
+    edge label/.style={font=\scriptsize, midway, fill=white, inner sep=1pt},
+    workerset/.style={font=\scriptsize\ttfamily, text=blue!70!black},
+    arrow/.style={->, >=stealth, thick},
+]
+    % Root
+    \node[rootnode] (root) {root};
+
+    % Level 1: shared system prompt block
+    \node[treenode, below=1.2cm of root] (b1) {$b_1$};
+    \draw[arrow] (root) -- node[edge label, right] {\texttt{0xa3f1}} (b1);
+    \node[workerset, left=0.3cm of b1] {$\{w_1, w_2\}$};
+
+    % Level 2: shared system prompt block
+    \node[treenode, below=1.2cm of b1] (b2) {$b_2$};
+    \draw[arrow] (b1) -- node[edge label, right] {\texttt{0x7c02}} (b2);
+    \node[workerset, left=0.3cm of b2] {$\{w_1, w_2\}$};
+
+    % Level 3: divergence — two different user messages
+    \node[treenode, below left=1.2cm and 1.5cm of b2] (b3a) {$b_3$};
+    \node[treenode, below right=1.2cm and 1.5cm of b2] (b3b) {$b_3'$};
+
+    \draw[arrow] (b2) -- node[edge label, left] {\texttt{0xee14}} (b3a);
+    \draw[arrow] (b2) -- node[edge label, right] {\texttt{0x51d9}} (b3b);
+
+    \node[workerset, left=0.3cm of b3a] {$\{w_1\}$};
+    \node[workerset, right=0.3cm of b3b] {$\{w_2\}$};
+
+    % Annotations
+    \draw[decorate, decoration={brace, amplitude=6pt, mirror}, thick, gray]
+        ([xshift=-2.8cm]b1.north) -- ([xshift=-2.8cm]b2.south)
+        node[midway, left=8pt, font=\footnotesize, align=right, text=gray] {shared system\\prompt (2 blocks)};
+    \draw[decorate, decoration={brace, amplitude=6pt, mirror}, thick, gray]
+        ([xshift=-2.8cm]b3a.north) -- ([xshift=-2.8cm]b3a.south)
+        node[midway, left=8pt, font=\footnotesize, align=right, text=gray] {user message\\(diverges)};
+\end{tikzpicture}
+\caption{A radix tree with two requests sharing a two-block system prompt prefix. Edge labels are \texttt{LocalBlockHash} values (truncated for readability). Worker sets at each node show which GPUs have that block cached. Workers $w_1$ and $w_2$ both cache the shared prefix ($b_1$, $b_2$); they diverge at the user message, where $w_1$ cached one user's query ($b_3$, hash \texttt{0xee14}) and $w_2$ cached another ($b_3'$, hash \texttt{0x51d9}). A new request with the same system prompt but a third user message would match both workers for depth~2, and neither for depth~3.}
+\label{fig:radix-tree-example}
+\end{figure}
+
+Note that Dynamo's \texttt{RadixTree} does not perform explicit edge compression in its data structure---each \texttt{RadixBlock} node corresponds to a single block hash. The ``radix tree'' behavior emerges implicitly: when a node has only one child, the tree effectively stores a single-element edge, and the traversal simply follows the single child pointer. True compression (storing multiple hashes on a single edge) would complicate insertion and deletion logic for a marginal performance gain.
+
+\subsection{Dynamo's Node Structure}
+
+In Dynamo's \texttt{RadixTree}, each node is a \texttt{RadixBlock}:
+
+\begin{verbatim}
+pub(crate) struct RadixBlock {
+    pub(crate) children:
+        FxHashMap<LocalBlockHash, SharedRadixBlock>,
+    pub(crate) workers: FxHashSet<WorkerWithDpRank>,
+    pub(crate) block_hash:
+        Option<ExternalSequenceBlockHash>,
+    pub(crate) recent_uses: VecDeque<Instant>,
+}
+\end{verbatim}
+
+Four fields serve four purposes:
+
+\begin{itemize}
+  \item \textbf{\texttt{children}}: A hash map from \texttt{LocalBlockHash} to child nodes. Each child represents the next block in a stored sequence. The use of \texttt{FxHashMap} (a fast, non-cryptographic hash map from the \texttt{rustc-hash} crate) optimizes for the common case of small maps with integer keys.
+  \item \textbf{\texttt{workers}}: The set of workers that have this block cached. When we traverse the tree during \texttt{find\_matches}, this set tells us which workers can reuse this block's KV cache. Workers are identified by \texttt{WorkerWithDpRank}, a struct combining a \texttt{WorkerId} (a \texttt{u64}) with a data-parallel rank.
+  \item \textbf{\texttt{block\_hash}}: The external sequence block hash---a position-aware hash that incorporates the block's ancestry. This is \texttt{None} for the root node and \texttt{Some(...)} for all others.
+  \item \textbf{\texttt{recent\_uses}}: A time-ordered buffer of recent accesses, used for frequency-based routing when \texttt{expiration\_duration} is configured. This enables the router to prefer ``hot'' prefixes over stale ones.
+\end{itemize}
+
+The tree itself stores a root node and a per-worker lookup table:
+
+\begin{verbatim}
+pub struct RadixTree {
+    pub(crate) root: SharedRadixBlock,
+    pub(crate) lookup: FxHashMap<
+        WorkerWithDpRank,
+        FxHashMap<ExternalSequenceBlockHash,
+                  SharedRadixBlock>>,
+    pub(crate) expiration_duration: Option<Duration>,
+}
+\end{verbatim}
+
+\marginnote{\texttt{Shared\-Radix\-Block} is \texttt{Rc<Ref\-Cell<\-Radix\-Block>{}>}---a reference-counted pointer with runtime borrow checking.}%
+The \texttt{lookup} table provides $O(1)$ access to any block by worker and sequence hash, bypassing the need to traverse the tree from the root. This is essential for \texttt{apply\_event} operations, where a store event specifies a parent hash and needs to find the parent block directly.
+
+\begin{notebox}
+The \texttt{lookup} table serves a dual purpose: it enables $O(1)$ block access for event processing, and it provides tree size information per worker. The \texttt{tree\_sizes} field in \texttt{OverlapScores} is populated from \texttt{lookup.get(worker).len()}, giving the router a signal about how much data each worker has cached overall---used as a tie-breaker when multiple workers have identical overlap scores.
+\end{notebox}
+
+
+\section{Block Hashing}
+\label{sec:kvrouter:hashing}
+
+Before the radix tree can store or look up a request's tokens, the token sequence must be converted into a sequence of block hashes. This conversion is a two-step process:
+
+\begin{enumerate}
+  \item \textbf{Partition into blocks.} The token sequence is divided into fixed-size blocks of $B$ tokens (typically $B = 16$ or $B = 32$). The function \texttt{compute\_block\_hash\_for\_seq} uses \texttt{chunks\_exact(kv\_block\_size as usize)}, meaning only complete blocks are hashed---any trailing partial block is discarded. This is correct because only complete blocks can be cached and reused.
+  \item \textbf{Hash with XXH3.} Each block is hashed using XXH3 (a fast, non-cryptographic hash function from the \texttt{xxhash-rust} crate) with seed \texttt{1337}. The input bytes are the little-endian encoding of the token IDs in the block.
+\end{enumerate}
+
+This produces a \texttt{LocalBlockHash}---a \texttt{u64} that identifies the \emph{content} of a block:
+
+\begin{verbatim}
+pub struct LocalBlockHash(pub u64);
+\end{verbatim}
+
+\subsection{Sequence Hashes: Encoding Position}
+
+\marginnote{\emph{Positional hashing:} incorporating sequence position into the block hash to distinguish otherwise-identical blocks at different positions.}%
+A \texttt{LocalBlockHash} captures \emph{what} tokens are in a block, but not \emph{where} the block appears in the sequence. This distinction matters because the KV cache values depend on position---via RoPE (Rotary Position Embedding) or other positional encodings. Two blocks with identical tokens at positions 0 and 100 produce different KV cache entries and must not be confused.
+
+Dynamo solves this with \texttt{ExternalSequenceBlockHash}, a rolling hash that chains each block to its parent:
+
+\begin{verbatim}
+pub struct ExternalSequenceBlockHash(pub u64);
+\end{verbatim}
+
+The computation is defined in \texttt{compute\_seq\_hash\_for\_block}:
+
+\begin{verbatim}
+// First block: seq_hash = local_hash
+sequence_hashes.push(block_hashes[0].0);
+
+// Subsequent blocks:
+// seq_hash = XXH3([parent_seq_hash, current_local_hash])
+for i in 1..block_hashes.len() {
+    let combined = [sequence_hashes[i-1],
+                    block_hashes[i].0];
+    let bytes: Vec<u8> = combined.iter()
+        .flat_map(|&num| num.to_le_bytes())
+        .collect();
+    let seq_hash = compute_hash(&bytes);
+    sequence_hashes.push(seq_hash);
+}
+\end{verbatim}
+
+The first block's sequence hash equals its local hash (it has no parent). Each subsequent block's sequence hash is \texttt{XXH3(parent\_seq\_hash || local\_hash)}. This creates a chain: the sequence hash at position $i$ depends on every block from position 0 through $i$. Two sequences that share a common prefix of length $k$ blocks will have identical sequence hashes for blocks $0$ through $k-1$ and divergent hashes from block $k$ onward.
+
+\begin{insightbox}
+The radix tree uses \texttt{LocalBlockHash} as keys in the \texttt{children} map (for tree traversal), and \texttt{ExternalSequenceBlockHash} as keys in the \texttt{lookup} table (for direct block access). This two-hash design separates the concerns of tree navigation (content-based) and block identification (position-aware).
+\end{insightbox}
+
+\subsection{LoRA and Multimodal Hashing}
+
+The hash computation can incorporate additional context beyond raw tokens. When a LoRA adapter name is provided, it is mixed into the XXH3 seed:
+
+\begin{verbatim}
+let seed = match lora_name.filter(|n| !n.is_empty()) {
+    Some(name) =>
+        XXH3_SEED.wrapping_add(xxh3::xxh3_64(name.as_bytes())),
+    None => XXH3_SEED,
+};
+\end{verbatim}
+
+This ensures that blocks cached under different LoRA adapters produce distinct hashes---the same tokens processed by adapter A and adapter B yield different KV cache entries and must not be conflated. Similarly, when multimodal metadata is present (image embeddings, for instance), the multimodal object hashes are appended to the token bytes before hashing, ensuring that blocks with identical tokens but different images produce different block hashes.
+
+\subsection{Lazy Hash Computation}
+
+Hash computation is not free---for a 4096-token prompt with block size 32, computing 128 block hashes involves 128 XXH3 invocations, plus 128 more for the rolling sequence hashes. To avoid paying this cost when it is not needed, Dynamo wraps tokens in a \texttt{TokensWithHashes} struct that computes hashes lazily:
+
+\begin{verbatim}
+pub struct TokensWithHashes {
+    tokens: Vec<u32>,
+    block_size: u32,
+    block_hashes: Option<Vec<LocalBlockHash>>,
+    seq_hashes: Option<Vec<SequenceHash>>,
+    // ... additional fields
+}
+\end{verbatim}
+
+The \texttt{get\_or\_compute\_block\_hashes()} method computes block hashes on first call and caches the result. The \texttt{get\_or\_compute\_seq\_hashes()} method first ensures block hashes are computed (since sequence hashes depend on them), then computes and caches the rolling sequence hashes. If the routing decision path calls \texttt{find\_matches} and then later needs to record the routing decision (which requires sequence hashes), the block hashes computed for the first call are reused---avoiding redundant work.
+
+With hashing in place, we can now turn to how the router \emph{uses} these hashes: given a sequence of block hashes for a new request, how does the radix tree produce a per-worker overlap score, and how does the cost function convert those scores into a routing decision?
+
+\section{The Routing Cost Function}
+\label{sec:kvrouter:cost}
+
+The \texttt{find\_matches} method on \texttt{RadixTree} walks the tree along the request's block hash sequence and produces an \texttt{OverlapScores} struct:
+
+\begin{verbatim}
+pub struct OverlapScores {
+    pub scores: FxHashMap<WorkerWithDpRank, u32>,
+    pub frequencies: Vec<usize>,
+    pub tree_sizes: FxHashMap<WorkerWithDpRank, usize>,
+}
+\end{verbatim}
+
+The \texttt{scores} map records, for each worker, the number of consecutive prefix blocks that worker has cached. This is the \emph{overlap depth}: if worker $w$ has cached blocks 0 through 49 of a 100-block request, its overlap score is 50.
+
+\subsection{The Traversal Algorithm}
+
+The traversal maintains an \emph{active set} of workers. Starting from the root, it looks up the first block hash in the root's children. The workers at that child node form the initial active set. As traversal proceeds through the sequence:
+
+\begin{itemize}
+  \item If a child node has \emph{fewer} workers than the active set, workers have ``dropped out''---they do not have this block cached. The algorithm records their scores (the depth at which they dropped) and shrinks the active set.
+  \item If a child node has \emph{more} workers than the active set, this indicates stale entries---workers whose ancestor remove events have arrived but whose descendant remove events have not yet propagated. The code handles this with a full membership check, retaining only workers present in both sets.
+  \item If the active set has exactly one worker remaining and \texttt{early\_exit} is true, the algorithm stops---there is only one candidate, and further traversal cannot change the decision.
+\end{itemize}
+
+Workers that survive to the deepest matched level receive the maximum score. This traversal is $O(k)$ in the number of blocks $k$, with each step performing a hash map lookup and a set intersection.
+
+\begin{notebox}
+The \texttt{early\_exit} optimization reflects a design trade-off: when only one worker matches any prefix at all, there is no benefit to determining the exact overlap depth---the router will select that worker regardless. By stopping early, the router reduces latency on the critical path. The \texttt{early\_exit} flag is set to \texttt{true} when the routing decision only needs a single candidate, not a complete ranking.
+\end{notebox}
+
+\subsection{Event Processing: Building and Maintaining the Tree}
+
+The radix tree is not built from a static dataset---it is maintained incrementally as workers report cache events. The \texttt{apply\_event} method processes three kinds of events, each represented by a variant of \texttt{KvCacheEventData}:
+
+\textbf{Stored events.} When a worker finishes prefilling a request, it reports which blocks were stored. The event contains a \texttt{parent\_hash} (the sequence hash of the block after which the new blocks follow, or \texttt{None} if they start from the root) and a list of \texttt{KvCacheStoredBlockData} entries, each containing a \texttt{block\_hash} (sequence hash), a \texttt{tokens\_hash} (local hash), and optional multimodal metadata. The algorithm:
+
+\begin{enumerate}
+  \item Looks up the parent block in the worker's \texttt{lookup} table (or uses the root if \texttt{parent\_hash} is \texttt{None}).
+  \item For each block in the event, borrows the parent mutably, inserts the worker into the parent's \texttt{workers} set, then looks up or creates the child in the parent's \texttt{children} map.
+  \item Registers the new block in the worker's \texttt{lookup} table for future $O(1)$ access.
+\end{enumerate}
+
+A key subtlety: the algorithm uses a ``deferred insert'' pattern to avoid double-borrowing. It holds a mutable borrow on the parent to insert the child, but the worker insertion into the \emph{child's} worker set is deferred to the next iteration, when the child becomes the new parent. This hand-over-hand borrowing is what makes the self-reference bug (Bug~\#2) possible when the child \texttt{Rc} aliases the parent.
+
+\textbf{Removed events.} When a worker evicts blocks from its KV cache, it reports the sequence hashes of the evicted blocks. The algorithm looks up each block hash in the worker's \texttt{lookup} table, removes the worker from the block's \texttt{workers} set, and if the set becomes empty, clears the block's children (since no worker has any descendant blocks cached either). Importantly, removal does \emph{not} cascade to descendant blocks---each block is removed individually. This means the tree may transiently contain ``stale'' entries where a child block lists a worker that its parent does not. The \texttt{find\_matches} traversal handles this gracefully via the \texttt{child\_count > active\_count} branch.
+
+\textbf{Cleared events.} When a worker restarts or loses all its cache, it sends a cleared event. This removes the worker from every block it had registered, but keeps the worker tracked in the \texttt{lookup} table (with an empty map) so the router knows the worker exists and can route new requests to it.
+
+The traversal and event-processing algorithms described above assume exclusive access to the tree---but in a production router, reads (\texttt{find\_matches}) and writes (\texttt{apply\_event}) may arrive concurrently. The next section examines how Dynamo handles this with three different concurrency strategies.
+
+\section{Concurrency: \texttt{Rc<RefCell>} vs \texttt{Arc<RwLock>}}
+\label{sec:kvrouter:concurrency}
+
+\marginnote{\emph{Interior mutability:} mutating data through a shared reference, checked at runtime rather than compile time.}%
+The radix tree is a shared, mutable data structure: routing decisions read from it, while cache updates (insertions, evictions) write to it. Dynamo provides \emph{three} implementations of the indexer, each with different concurrency properties.
+
+\subsection{RadixTree: Single-Threaded with Rc<RefCell>}
+
+The original implementation uses \texttt{Rc<RefCell<RadixBlock>{}>} for nodes---reference-counted pointers with runtime borrow checking. \texttt{Rc} (Reference Counted) is Rust's single-threaded shared ownership type: it tracks how many pointers reference a value and frees the value when the count reaches zero. \texttt{RefCell} provides interior mutability by enforcing the borrowing rules at runtime instead of compile time.
+
+\begin{verbatim}
+pub(crate) type SharedRadixBlock = Rc<RefCell<RadixBlock>>;
+\end{verbatim}
+
+This is a single-threaded design: \texttt{Rc} does not implement the \texttt{Send} or \texttt{Sync} traits, so the Rust compiler physically prevents the tree from being shared across threads. All operations---event processing and match requests---run on a single thread in an async event loop.
+
+The advantage is zero synchronization overhead. Every pointer traversal is a simple reference count increment (no atomic operations), and every borrow check is a cheap comparison of a cell-local counter. The disadvantage is that read operations (\texttt{find\_matches}) and write operations (\texttt{apply\_event}) cannot overlap---the single thread must serialize them. For small-to-medium deployments where the routing decision latency is dominated by network I/O rather than tree traversal, this is acceptable. For high-throughput deployments with hundreds of workers and thousands of concurrent requests, the serialization becomes a bottleneck.
+
+\begin{bugbox}
+The \texttt{Rc<RefCell>} design has a subtle failure mode discovered by our fuzzing campaign. During \texttt{apply\_event}, the algorithm traverses from parent to child, holding a mutable borrow on the parent (\texttt{parent\_mut = current.borrow\_mut()}) while looking up the child in \texttt{parent\_mut.children}. If a hash collision causes a node to be inserted as its own child---that is, the child \texttt{Rc} points to the same allocation as the parent---the subsequent \texttt{child.borrow\_mut()} panics because the parent's \texttt{RefCell} is already mutably borrowed. This is Bug~\#2 in Chapter~\ref{ch:findings}: a self-referencing block causing a \texttt{RefCell} panic (or a deadlock in the concurrent variant).
+
+The fix was a runtime guard using \texttt{try\_borrow\_mut}:
+\begin{verbatim}
+if child.try_borrow_mut().is_err() {
+    tracing::warn!(
+        "Detected self referencing block; \
+         rejecting sequence"
+    );
+    return Err(
+        KvCacheEventError::InvalidBlockSequence);
+}
+\end{verbatim}
+This converts the panic into a graceful error return, but the underlying issue---that the \texttt{lookup} table can alias a block back to itself---remains a structural property of the design.
+\end{bugbox}
+
+\begin{whynotbox}{Why \texttt{Rc<RefCell>} instead of \texttt{Arc<RwLock>} by default?}
+If the concurrent variant exists, why not use it everywhere and avoid the single-threaded limitation?
+
+\textbf{Cost of atomics.} Every \texttt{Arc::clone()} performs an atomic increment---roughly 5--20$\times$ slower than \texttt{Rc::clone()}'s non-atomic increment on modern x86 hardware. During \texttt{find\_matches}, the traversal clones a shared pointer at every level of the tree. For a 200-block prefix, that is 200 atomic operations per routing decision. At 1000 requests per second, this adds up to 200{,}000 unnecessary atomic operations per second when all work runs on a single async thread anyway.
+
+\textbf{Lock overhead.} Each \texttt{RwLock::read()} acquires a reader lock, even when no writer is present. The \texttt{parking\_lot} implementation is fast (a single atomic compare-and-swap in the uncontended case), but \texttt{RefCell::borrow()} is faster still---a non-atomic comparison of a cell-local counter.
+
+\textbf{The design philosophy.} Dynamo defaults to single-threaded operation (\texttt{router\_event\_threads = 1}) and only opts into the concurrent variant when the deployment scale justifies the overhead. This is Rust's zero-cost abstraction principle applied to data structure design: pay for concurrency only when you need it.
+\end{whynotbox}
+
+\subsection{ConcurrentRadixTree: Multi-Threaded with Arc<RwLock>}
+
+The concurrent variant replaces every \texttt{Rc} with \texttt{Arc} (Atomic Reference Counting) and every \texttt{RefCell} with \texttt{RwLock} (Reader-Writer Lock):
+
+\begin{verbatim}
+pub type SharedBlock = Arc<RwLock<Block>>;
+\end{verbatim}
+
+\texttt{Arc} uses atomic operations for reference counting, making it safe to share across threads. \texttt{RwLock} (from the \texttt{parking\_lot} crate, which provides a faster implementation than the standard library's) allows multiple concurrent readers or a single exclusive writer. The tree node structure is nearly identical to \texttt{RadixBlock}, but without the \texttt{recent\_uses} field---frequency tracking is omitted to keep \texttt{find\_matches} fully read-only.
+
+The concurrency model is:
+\begin{itemize}
+  \item Multiple \texttt{find\_matches} calls can run in parallel, each acquiring only read locks.
+  \item Write operations (\texttt{apply\_event}, \texttt{remove\_worker}) acquire write locks.
+  \item Deadlock prevention is ensured by always locking parent before child (hand-over-hand locking).
+\end{itemize}
+
+The configuration parameter \texttt{router\_event\_threads} (default: 4) controls which implementation is used. When set to 1, the single-threaded \texttt{RadixTree} is used. When greater than 1, the \texttt{ConcurrentRadixTree} with a thread pool handles events on $N$ worker threads while \texttt{find\_matches} runs inline on the caller's thread.
+
+\begin{notebox}
+Both the \texttt{RadixTree} and \texttt{ConcurrentRadixTree} implement a custom \texttt{Drop} to avoid stack overflow. A deeply nested tree dropped recursively would create a call stack proportional to the tree depth. Both implementations use an iterative approach: they drain children into a stack vector and drop them in a loop, converting $O(d)$ recursion depth into $O(1)$ stack usage.
+\end{notebox}
+
+\subsection{PositionalIndexer: A Flat Alternative}
+
+The third implementation, \texttt{PositionalIndexer}, abandons the tree structure entirely. Instead of building a trie, it stores blocks in a flat \texttt{DashMap} keyed by \texttt{(position, LocalBlockHash)} pairs:
+
+\begin{verbatim}
+pub struct PositionalIndexer {
+    index: DashMap<(usize, LocalBlockHash),
+                   SeqEntry, FxBuildHasher>,
+    tree_sizes: DashMap<WorkerWithDpRank,
+                        AtomicUsize, FxBuildHasher>,
+    jump_size: usize,
+}
+\end{verbatim}
+
+Instead of traversing a tree, \texttt{find\_matches} performs a \emph{jump search}: it checks positions at intervals of \texttt{jump\_size} (e.g., 32), and only scans intermediate positions when workers drop out at a jump boundary. This exploits the observation that if a worker matches at position $p$ and also at position $p + 32$, it very likely matches at all intermediate positions (since blocks form a chain and eviction typically removes entire suffixes).
+
+The jump search algorithm proceeds as follows:
+\begin{enumerate}
+  \item Initialize the active set from workers matching at position 0.
+  \item Jump forward by \texttt{jump\_size} positions.
+  \item If the same number of workers match at the destination: skip the intermediate positions and continue jumping (fast path).
+  \item If fewer workers match: scan the intermediate range position-by-position to find the exact dropout points (slow path).
+  \item Record final scores for workers that survive to the end.
+\end{enumerate}
+
+The worst-case complexity is still $O(k)$, but the average case is $O(k / \mathit{jump\_size})$ when prefixes are long and workers are stable---a significant speedup for prompts with thousands of blocks.
+
+\begin{insightbox}
+The \texttt{PositionalIndexer} also computes \texttt{ExternalSequenceBlockHash} lazily during \texttt{find\_matches}, using \texttt{ensure\_seq\_hash\_computed} to extend a vector of rolling hashes on demand. This avoids computing sequence hashes for positions beyond the first mismatch, saving work when the matching prefix is short.
+\end{insightbox}
+
+The \texttt{PositionalIndexer}'s innermost lookup uses a \texttt{SeqEntry} enum that optimizes for the common case:
+
+\begin{verbatim}
+enum SeqEntry {
+    Single(ExternalSequenceBlockHash,
+           FxHashSet<WorkerWithDpRank>),
+    Multi(FxHashMap<ExternalSequenceBlockHash,
+                    FxHashSet<WorkerWithDpRank>>),
+}
+\end{verbatim}
+
+At a given \texttt{(position, local\_hash)} pair, there is typically only one sequence hash (the \texttt{Single} variant), because most blocks at a given position with a given content hash share the same ancestry. The \texttt{Multi} variant handles the rare case where different prefix paths lead to blocks with identical content at the same position but different ancestry---causing distinct sequence hashes. By avoiding a \texttt{HashMap} allocation in the common case, \texttt{SeqEntry} reduces memory overhead significantly for large trees.
+
+\subsection{The SyncIndexer Trait}
+
+All three implementations conform to the \texttt{SyncIndexer} trait, which provides a uniform interface for the thread pool infrastructure:
+
+\begin{verbatim}
+pub trait SyncIndexer: Send + Sync + 'static {
+    fn worker(&self,
+        event_receiver: flume::Receiver<WorkerTask>)
+        -> anyhow::Result<()>;
+    fn find_matches(&self,
+        sequence: &[LocalBlockHash],
+        early_exit: bool) -> OverlapScores;
+}
+\end{verbatim}
+
+The \texttt{worker} method runs on a dedicated thread, processing events from a channel. The \texttt{find\_matches} method runs inline on the caller's thread---this is the key architectural insight. By keeping reads on the caller's thread and dispatching writes to worker threads, the system avoids channel overhead for the latency-sensitive read path while allowing writes to happen concurrently in the background. The higher-level \texttt{KvIndexerInterface} trait wraps \texttt{SyncIndexer} with async methods and Tokio channels for integration with the async runtime.
+
+With the indexer providing overlap scores and the concurrency model ensuring those scores are computed safely, we can now examine the component that consumes them: the worker selector, which converts raw overlap scores into a final routing decision.
+
+\section{The DefaultWorkerSelector}
+\label{sec:kvrouter:selector}
+
+\marginnote{\emph{ISL (Input Sequence Length):} the number of tokens in the request, used as a sizing signal.}%
+The \texttt{DefaultWorkerSelector} is the concrete implementation that ties together the radix tree, cost function, and worker state. It implements the \texttt{WorkerSelector<C>} trait:
+
+\begin{verbatim}
+pub trait WorkerSelector<C: WorkerConfigLike> {
+    fn select_worker(
+        &self,
+        workers: &HashMap<WorkerId, C>,
+        request: &SchedulingRequest,
+        block_size: u32,
+    ) -> Result<WorkerSelectionResult, KvSchedulerError>;
+}
+\end{verbatim}
+
+The generic parameter \texttt{C: WorkerConfigLike} abstracts over worker configuration, requiring methods \texttt{data\_parallel\_size()}, \texttt{data\_parallel\_start\_rank()}, \texttt{max\_num\_batched\_tokens()}, and \texttt{total\_kv\_blocks()}. This allows the selector to work with different backend configurations without coupling to any specific type.
+
+The \texttt{SchedulingRequest} that arrives at the selector has already been enriched with information from multiple sources:
+
+\begin{verbatim}
+pub struct SchedulingRequest {
+    pub isl_tokens: usize,
+    pub overlaps: OverlapScores,
+    pub decode_blocks: HashMap<WorkerWithDpRank, usize>,
+    pub prefill_tokens: HashMap<WorkerWithDpRank, usize>,
+    pub router_config_override: Option<RouterConfigOverride>,
+    pub allowed_worker_ids: Option<HashSet<WorkerId>>,
+    // ... additional fields
+}
+\end{verbatim}
+
+The \texttt{overlaps} field comes from the indexer's \texttt{find\_matches}. The \texttt{decode\_blocks} and \texttt{prefill\_tokens} fields come from the active sequence tracker, which monitors in-flight requests. The optional \texttt{allowed\_worker\_ids} enables Endpoint Priority Policies (EPP) to restrict routing to a subset of workers.
+
+\subsection{The Scoring Formula}
+
+For each worker (and each of its data-parallel ranks), the selector computes a logit:
+
+\begin{verbatim}
+let logit = overlap_weight * potential_prefill_block
+            + decode_block;
+\end{verbatim}
+
+This formula combines two signals:
+
+\begin{itemize}
+  \item \texttt{potential\_prefill\_block}: the number of blocks that would need to be prefilled, computed as \texttt{prefill\_tokens / block\_size}. When a worker has high cache overlap, this value is small (fewer blocks to compute), producing a lower logit. When overlap is zero, this equals the total request blocks.
+  \item \texttt{decode\_block}: the number of active decode blocks on this worker---a measure of the worker's current load. Workers with more decode blocks are busier.
+  \item \texttt{overlap\_weight}: the tunable parameter from \texttt{KvRouterConfig} (default: 1.0). Higher values prioritize cache reuse; lower values prioritize load balancing.
+\end{itemize}
+
+\begin{notebox}
+The logit represents \emph{cost}, not benefit---lower is better. A worker with high cache overlap has fewer prefill blocks (lower first term), and a lightly loaded worker has fewer decode blocks (lower second term). The selector seeks the worker with the \emph{minimum} logit.
+\end{notebox}
+
+\subsection{Softmax Sampling}
+
+Rather than deterministically selecting the minimum-logit worker, the selector uses \emph{softmax sampling} with a configurable temperature:
+
+\begin{verbatim}
+let candidates = softmax_sample(&worker_logits,
+                                temperature);
+\end{verbatim}
+
+The \texttt{softmax\_sample} function normalizes the logits, negates them (since lower is better), scales by temperature, and samples from the resulting probability distribution. The temperature parameter controls exploration:
+
+\begin{itemize}
+  \item \texttt{temperature = 0.0} (default): deterministic selection. Returns the worker(s) with the minimum logit. If multiple workers are tied, returns all of them.
+  \item \texttt{temperature > 0}: stochastic selection. Workers with lower logits are more likely to be selected, but any worker has a nonzero probability. Higher temperatures increase randomness.
+\end{itemize}
+
+When \texttt{temperature = 0.0} produces a tie (multiple workers with identical logits), the selector applies a \emph{tree size tie-breaker}: it selects the worker with the smallest tree size (fewest cached blocks overall). The intuition is that, among equally good workers for this request, the one with less total cache pressure is preferable. If tree sizes are also tied, the selection falls back to random.
+
+\begin{whynotbox}{Why softmax sampling instead of always picking the best worker?}
+With temperature 0 (the default), the selector \emph{does} pick the best worker deterministically. So why support nonzero temperature at all?
+
+\textbf{Exploration.} A deterministic policy converges to a fixed routing pattern: the first worker to cache a popular prefix attracts all future requests for that prefix, and no other worker ever builds up cache for it. If that worker fails or becomes overloaded, the system has no fallback. Stochastic selection with a small temperature (e.g., 0.1) occasionally routes a request to a suboptimal worker, seeding cache entries that provide resilience.
+
+\textbf{Fairness under skew.} In workloads with a power-law distribution of system prompts, the top-$k$ most popular prompts dominate traffic. Deterministic routing concentrates these on $k$ workers, leaving the rest underutilized. A small temperature spreads the load more evenly, at the cost of slightly lower cache hit rates.
+
+\textbf{The softmax is cheap.} Computing $\exp(-\mathit{logit}_i / T)$ for $W$ workers involves $W$ exponentiations---negligible compared to the tree traversal or network round-trip. The flexibility costs almost nothing at runtime.
+\end{whynotbox}
+
+\subsection{The Complete Routing Path}
+
+Putting it all together, the complete routing path for a new request is:
+
+\begin{enumerate}
+  \item The \texttt{SchedulingRequest} arrives with \texttt{isl\_tokens} (input sequence length), pre-computed \texttt{overlaps} (from the indexer's \texttt{find\_matches}), and per-worker \texttt{decode\_blocks} and \texttt{prefill\_tokens} from the active sequence tracker.
+  \item The selector computes \texttt{request\_blocks = isl\_tokens.div\_ceil(block\_size)}.
+  \item For each worker and data-parallel rank, it computes the logit using the formula above.
+  \item Softmax sampling selects a candidate (or candidates, in the case of ties at temperature 0).
+  \item Ties are broken by tree size, then randomly.
+  \item The result is a \texttt{WorkerSelectionResult} containing the chosen \texttt{WorkerWithDpRank}, the number of required blocks, and the estimated overlap blocks.
+\end{enumerate}
+
+\begin{bugbox}
+Step 2 contains a potential division-by-zero: \texttt{isl\_tokens.div\_ceil(block\_size as usize)} will panic if \texttt{block\_size} is zero. Our fuzzing campaign detected this as Bug~\#14 (Chapter~\ref{ch:findings}). In production, \texttt{block\_size} is set from the model configuration and is never zero, but the function does not validate its input. The same pattern---unchecked \texttt{div\_ceil} with an untrusted divisor---appeared in three other locations in the codebase.
+\end{bugbox}
+
+\subsection{Configuration and Tuning}
+
+The \texttt{KvRouterConfig} struct centralizes all routing parameters. Beyond \texttt{overlap\_score\_weight} and \texttt{router\_temperature} (discussed above), several other parameters shape routing behavior:
+
+\begin{itemize}
+  \item \texttt{router\_track\_active\_blocks} (default: \texttt{true}): Whether to account for blocks from in-flight requests in the overlap calculation. When enabled, the router adds ``placeholder'' blocks for requests that are currently being processed, so a second request with the same prefix sees the first request's blocks as already claimed.
+  \item \texttt{router\_assume\_kv\_reuse} (default: \texttt{true}): When tracking active blocks, whether to compute actual hash sequences (enabling cache-aware routing for in-flight requests) or use random hashes (assuming no reuse). Setting this to \texttt{false} saves hash computation at the cost of routing quality.
+  \item \texttt{router\_ttl\_secs} (default: 120.0): When KV events are disabled, blocks expire from the tree after this duration. This prevents stale cache entries from influencing routing decisions indefinitely.
+  \item \texttt{router\_max\_tree\_size} (default: $2^{20}$ = 1,048,576): The maximum number of blocks before pruning is triggered, preventing unbounded memory growth.
+\end{itemize}
+
+These parameters interact in subtle ways. For instance, \texttt{router\_assume\_kv\_reuse = true} with \texttt{overlap\_score\_weight = 0} wastes hash computation (computing hashes that are never used for scoring). The config validation catches some of these inconsistencies but not all---another area where fuzzing proved valuable by exercising unusual parameter combinations.
+
+
+\section{Summary}
+
+\begin{itemize}
+  \item The \textbf{routing problem} balances KV cache reuse, load balancing, and latency minimization across a fleet of GPU workers. It reduces to prefix matching over block hash sequences.
+  \item A \textbf{radix tree} stores block hashes with per-node worker sets, enabling efficient prefix overlap queries in $O(k)$ time. Each \texttt{RadixBlock} node contains a \texttt{children} map, a \texttt{workers} set, and an optional \texttt{block\_hash}.
+  \item \textbf{Block hashing} uses XXH3 to convert token blocks into \texttt{LocalBlockHash} values. \textbf{Sequence hashing} chains blocks into position-aware \texttt{ExternalSequenceBlockHash} values using a rolling hash, ensuring identical tokens at different positions produce different hashes.
+  \item The \textbf{cost function} computes a per-worker logit combining prefill cost (inversely related to cache overlap) and decode load, with a tunable \texttt{overlap\_score\_weight}. Selection uses softmax sampling with configurable temperature.
+  \item \textbf{Three indexer implementations} serve different concurrency needs: \texttt{RadixTree} (\texttt{Rc<RefCell>}, single-threaded), \texttt{ConcurrentRadixTree} (\texttt{Arc<RwLock>}, multi-reader), and \texttt{PositionalIndexer} (flat \texttt{DashMap} with jump search, multi-threaded).
+  \item The \texttt{Rc<RefCell>} design trades compile-time safety for runtime borrow checking---a category of bug detectable by fuzzing (Bug~\#2: self-referencing blocks causing \texttt{RefCell} panics or deadlocks).
+  \item The \textbf{DefaultWorkerSelector} orchestrates the full routing decision, from overlap scores through softmax sampling to tree-size tie-breaking.
+\end{itemize}
+
+\bigskip
+\begin{center}\rule{0.5\linewidth}{0.4pt}\end{center}
+\bigskip
+
+The router works in terms of block hashes, but where do those hashes come from? The next chapter explains how raw token sequences are partitioned into blocks, hashed with positional information, and managed through a type-state lifecycle.
+
+\bigskip
+\noindent\textbf{Check Your Understanding}
+
+\medskip
+\noindent\emph{These questions are answerable from this chapter alone.}
+
+\begin{enumerate}
+  \item Why is round-robin routing suboptimal for LLM inference? What information does it ignore?
+
+  \textbf{Answer:} Round-robin ignores the KV cache state on each worker. If worker A has already cached the KV entries for a request's system prompt (from a prior request), routing to worker A allows those cached entries to be reused, skipping the expensive prefill computation for those tokens. Round-robin might send the request to worker B, which has no relevant cache entries, forcing a full prefill and wasting GPU compute.
+
+  \item Explain the difference between a trie and a radix tree. Why does Dynamo use a radix tree rather than a plain trie?
+
+  \textbf{Answer:} A trie stores one element per node, while a radix tree compresses chains of single-child nodes into single edges carrying multiple elements. Dynamo uses a radix tree because LLM requests often share long common prefixes (system prompts) followed by short unique suffixes (user messages). The radix tree compresses the shared prefix into fewer nodes, reducing memory usage and traversal time. In the extreme case where all requests share a 1000-block system prompt, a trie would have 1000 single-child nodes; a radix tree collapses them.
+
+  \item Why must block hashing incorporate positional information? What would go wrong if two blocks with the same tokens at different positions produced the same hash?
+
+  \textbf{Answer:} The KV cache values at a given position depend on that position (via RoPE or other positional encodings). If blocks at positions 0 and 100 with identical tokens produced the same hash, the router might reuse the KV cache from position 0 when processing position 100---producing incorrect attention scores and corrupted model output. The \texttt{ExternalSequenceBlockHash} rolling chain ensures that position information is encoded in every block's identity.
+
+  \item The cost function balances cache overlap and load penalty. Describe a workload where pure cache-affinity routing would perform badly, and one where pure load balancing would perform badly.
+
+  \textbf{Answer:} Pure cache-affinity performs badly when many requests share the same system prompt---all requests would route to the same worker (the one that first cached the prompt), creating a hotspot while other workers sit idle. Pure load balancing performs badly when requests have diverse, long prompts with significant overlap potential---it would distribute requests uniformly, preventing any worker from building up useful cache state, causing every request to pay the full prefill cost.
+
+  \item Why does the \texttt{Rc<RefCell>} design create a risk of runtime panics that \texttt{Arc<RwLock>} would not? What structural property of the radix tree can trigger this failure?
+
+  \textbf{Answer:} \texttt{RefCell} enforces borrow rules at runtime and panics on violations. When a self-referencing block is created (a node that is its own child due to hash collision in the lookup table), the code holds a mutable borrow on the parent while trying to borrow the child---which is the same \texttt{RefCell}---causing a panic. With \texttt{Arc<RwLock>}, the same scenario would cause a deadlock (trying to acquire a write lock already held by the same thread) rather than a panic. Neither is correct, but the panic is more immediately detectable.
+
+  \item What is the purpose of the \texttt{early\_exit} flag in \texttt{find\_matches}? When is it beneficial?
+
+  \textbf{Answer:} When \texttt{early\_exit} is \texttt{true}, the algorithm stops as soon as only one worker remains in the active set, returning a score of 1 for that worker without determining the exact overlap depth. This is beneficial when the routing decision only needs to identify \emph{which} worker has some cache overlap, not \emph{how much}---reducing latency by avoiding unnecessary tree traversal.
+
+  \item How does the \texttt{PositionalIndexer}'s jump search algorithm achieve sub-linear average-case performance? Under what conditions does it degrade to linear?
+
+  \textbf{Answer:} The jump search checks positions at intervals of \texttt{jump\_size} (e.g., 32). If the same workers match at both endpoints of a jump, all intermediate positions are skipped---giving $O(k / \mathit{jump\_size})$ average case. It degrades to $O(k)$ when workers drop out at nearly every jump boundary, forcing a linear scan of each interval. This happens when the cache is fragmented---workers have cached scattered blocks rather than contiguous prefixes.
+
+  \item Why does the \texttt{DefaultWorkerSelector} use tree size as a tie-breaker rather than random selection when multiple workers have identical logits?
+
+  \textbf{Answer:} When workers have identical logits (same prefill cost and decode load), the worker with the smallest tree size has less total cache pressure---fewer blocks stored overall, meaning more room for future cache entries and less risk of eviction. Selecting this worker promotes cache diversity across the fleet. Random selection among tied workers would be fair but would miss this opportunity to spread cache load.
+\end{enumerate}

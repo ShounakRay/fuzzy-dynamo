@@ -1,0 +1,577 @@
+\chapter{Dynamo Architecture End-to-End}
+\label{ch:architecture}
+
+The previous chapters introduced the building blocks: transformer attention, KV caching, and distributed inference techniques. This chapter assembles them into the concrete system that is NVIDIA Dynamo. We trace a single request from the moment it arrives as an HTTP payload to the moment the last token streams back to the client, identifying every component it touches along the way. By the end, you will have a complete map of Dynamo's architecture---what each component does, why it exists, and how it communicates with its neighbors.
+
+
+%% ============================================================
+\section{A Request's Journey}
+\label{sec:architecture:journey}
+%% ============================================================
+
+\marginnote{\emph{SSE (Server-Sent Events):} a standard for streaming data from server to client over HTTP.}%
+Consider a user sending a chat completion request to a Dynamo cluster serving a large language model. The request begins its life as an HTTP POST carrying a JSON payload conforming to the OpenAI chat completions API---a format Dynamo deliberately supports for compatibility with the broader ecosystem. Let us trace every component the request touches.
+
+\subsection{Stage 1: HTTP Ingress}
+
+The request arrives at the \textbf{frontend server}, an async Rust HTTP service built on \texttt{axum} (a Tokio-based web framework). The frontend is implemented in the \texttt{dynamo-llm} crate's \texttt{http::\allowbreak service::\allowbreak service\_v2} module, which exposes OpenAI-compatible endpoints (\texttt{/v1/chat/\allowbreak completions}, \texttt{/v1/\allowbreak completions}, \texttt{/v1/\allowbreak embeddings}), plus Anthropic-format endpoints for messages. The frontend validates the incoming JSON, checks whether the requested model is registered (via a \texttt{ModelManager} that watches the service discovery plane), and determines whether the client wants a streaming or non-streaming response.
+
+\begin{notebox}
+Regardless of whether the client requests \texttt{stream=true} or \texttt{stream=false}, Dynamo internally propagates all requests as streaming. This simplifies the downstream pipeline to a single pattern: every request returns a stream of token fragments. For non-streaming client requests, the frontend aggregates the entire stream into a single JSON response before sending it back. This design decision eliminates an entire class of code paths and their associated bugs.
+\end{notebox}
+
+\subsection{Stage 2: Preprocessing}
+
+The validated request is handed to the \textbf{preprocessor} (in \texttt{dynamo-llm}'s \texttt{preprocessor} module). The preprocessor performs two critical transformations:
+
+\begin{enumerate}
+  \item \textbf{Chat template application.} The user's message array (\texttt{[{"role":"user","content":"Hello"}]}) must be converted into the specific prompt format that the model was trained on. Dynamo uses \texttt{minijinja}, a Rust implementation of the Jinja2 template engine, to apply model-specific chat templates. Different models require wildly different formats---Llama uses \texttt{<|begin\_of\_text|>} markers, ChatGLM uses \texttt{[gMASK]<sop>}, and Mistral uses \texttt{[INST]} tags. The template is loaded from the model's configuration at startup.
+
+  \item \textbf{Tokenization.} The formatted prompt string is tokenized into a sequence of integer token IDs using the \texttt{dynamo-llm} tokenizer module, which wraps the Hugging Face \texttt{tokenizers} library (itself a Rust crate with Python bindings). For models that use OpenAI's encoding, Dynamo falls back to \texttt{tiktoken-rs}. The result is a \texttt{Vec<u32>} of token IDs ready for the model.
+\end{enumerate}
+
+\marginnote{The preprocessor also handles media: images, audio, and video are fetched, decoded, and converted to tensor representations in this stage.}%
+
+With the prompt tokenized into a sequence of integer IDs, the system must now decide \emph{where} to send it. This is not a simple load-balancing decision---it depends on the state of every GPU's memory.
+
+\subsection{Stage 3: Routing}
+
+\marginnote{\emph{Stateful routing:} routing decisions that depend on the current state of the cluster (e.g., cached data), as opposed to stateless policies like round-robin.}%
+The token sequence now reaches the \textbf{router}, the most architecturally distinctive component in Dynamo. The router must answer the question: \emph{which GPU worker should process this request?}
+
+In conventional load balancers, routing is stateless---round-robin or least-connections. Dynamo's router is \emph{stateful}: it knows what KV cache blocks each worker currently holds in GPU memory. This knowledge comes from the \textbf{KV indexer}, a concurrent radix tree (Chapter~\ref{ch:kvrouter}) that maps token block hashes to worker IDs.
+
+The routing process works as follows:
+
+\begin{enumerate}
+  \item The router hashes the token sequence into fixed-size blocks using the \texttt{dynamo-tokens} crate's block hasher (Chapter~\ref{ch:tokens}). Each block of $B$ consecutive tokens is hashed with xxHash to produce a \texttt{LocalBlockHash}.
+
+  \item The router queries the radix tree for overlap scores: for each candidate worker, how many of the request's token blocks are already cached on that worker?
+
+  \item A \textbf{worker selector} (in \texttt{dynamo-kv-router}'s \texttt{scheduling::selector} module) combines the overlap score with the worker's current load (queue depth, active sequences, available KV cache capacity) to produce a composite cost. The worker with the lowest cost is selected.
+
+  \item If KV-aware routing is not enabled, the router falls back to round-robin or random selection via the \texttt{RouterMode} enum (\texttt{RoundRobin}, \texttt{Random}, \texttt{KV}, or \texttt{Direct}).
+\end{enumerate}
+
+The router is implemented as a \texttt{PushRouter} in \texttt{dynamo-runtime}'s pipeline framework. The KV-specific variant, \texttt{KvPushRouter} (in \texttt{dynamo-llm}'s \texttt{kv\_router::push\_router} module), wraps the generic \texttt{PushRouter} with KV-aware selection logic.
+
+\begin{insightbox}
+The router is where Dynamo's core innovation lives. Traditional inference serving systems treat GPU workers as interchangeable---any worker can handle any request. By tracking KV cache state across the cluster, Dynamo can route a request to the worker that already has the most relevant cached computation, turning a full prefill (potentially seconds) into a partial prefill (milliseconds). The cost is maintaining a distributed index of cache contents, which is exactly what the radix tree provides.
+\end{insightbox}
+
+\subsection{Stage 4: Request Dispatch}
+
+\marginnote{The \texttt{TwoPartCodec} uses a 24-byte preamble: 8 bytes for header length, 8 bytes for body length, 8 bytes for an xxHash checksum. See Chapter~\ref{ch:codecs} for details.}%
+Once the router selects a worker, the request is serialized and dispatched. Dynamo supports three transport modes for the \emph{request plane}, configured via the \texttt{TransportType} enum:
+
+\begin{itemize}
+  \item \texttt{Nats}: Messages are published to NATS subjects. The worker subscribes to its designated subject and dequeues requests. This mode uses NATS as a work queue with load balancing across subscribers in the same queue group.
+  \item \texttt{Http}: Requests are sent over HTTP/2 to the worker's advertised address.
+  \item \texttt{Tcp}: Requests are sent over persistent TCP connections using the custom \texttt{TwoPartCodec} binary protocol, which avoids the overhead of HTTP framing.
+\end{itemize}
+
+In the TCP path, the \texttt{TcpRequestMessage} carries the endpoint path (for routing within the worker), optional trace headers (for distributed tracing via OpenTelemetry), and the serialized payload.
+
+\begin{whynotbox}{Why not use gRPC instead of a custom TCP codec?}
+gRPC is the standard choice for inter-service communication in distributed systems, and Dynamo does use gRPC for some ancillary services. But the hot path---router to worker, worker to frontend---uses a custom \texttt{TwoPartCodec} over raw TCP instead. Why?
+
+\textbf{Framing overhead.} gRPC is built on HTTP/2, which adds frame headers, stream multiplexing metadata, HPACK-compressed headers, and WINDOW\_UPDATE flow control frames to every message. The \texttt{TwoPartCodec} uses a fixed 24-byte preamble (header length, body length, xxHash checksum) and nothing else. At thousands of messages per second per worker, those extra bytes and the CPU cycles to process them add up.
+
+\textbf{Serialization coupling.} gRPC mandates Protocol Buffers for serialization. Dynamo's internal messages are already Rust structs serialized with \texttt{serde}---adding a Protobuf layer would mean double serialization (Rust $\to$ serde $\to$ bytes $\to$ Protobuf $\to$ bytes) or a rewrite of all internal types as \texttt{.proto} files. The custom codec serializes Rust types directly via \texttt{bincode} or MessagePack, with zero intermediate copies.
+
+\textbf{Streaming model.} gRPC's streaming RPCs add per-message length-prefixed framing within the HTTP/2 stream. For token-by-token streaming where each message is tiny (a single token ID plus metadata), the framing overhead can exceed the payload size. The \texttt{TwoPartCodec} separates the header (routing metadata) from the body (payload) at the wire level, enabling the router to inspect headers without deserializing the body.
+
+gRPC remains an excellent choice when interoperability with external clients matters more than raw throughput---which is why Dynamo exposes gRPC endpoints in \texttt{dynamo-llm} for external integrations alongside the internal TCP path.
+\end{whynotbox}
+
+\subsection{Stage 5: Inference}
+
+The worker receives the request and feeds it to the \textbf{inference engine}. Dynamo does not implement its own GPU kernels for transformer inference; instead, it orchestrates existing engines:
+
+\begin{itemize}
+  \item \textbf{vLLM}: a Python-based engine with PagedAttention for efficient KV cache management.
+  \item \textbf{SGLang}: a fast serving framework with RadixAttention.
+  \item \textbf{TensorRT-LLM}: NVIDIA's optimized C++ inference engine with INT4/INT8 quantization.
+\end{itemize}
+
+Each engine is wrapped in a \texttt{PythonAsyncEngine} (via PyO3, discussed in Section~\ref{sec:architecture:pyo3}), which exposes the Python engine's async generator as a Rust \texttt{AsyncEngine} trait object. The engine produces tokens one at a time as an async stream.
+
+\marginnote{In disaggregated mode, prefill workers and decode workers are separate GPU pools. The prefill worker computes the KV cache and transfers it to the decode worker via NIXL before token generation begins.}%
+
+\marginnote{\emph{Disaggregated serving:} separating the prefill phase (compute-bound) from the decode phase (memory-bandwidth-bound) onto different GPU pools, each independently scaled.}%
+In a \textbf{disaggregated configuration}, the request may touch two workers:
+\begin{enumerate}
+  \item A \textbf{prefill worker} processes the full prompt, computing the KV cache for all input tokens. This is compute-bound (proportional to sequence length squared for attention).
+  \item The KV cache is transferred to a \textbf{decode worker} via NVIDIA's NIXL library, which performs direct GPU-to-GPU memory transfers without CPU involvement.
+  \item The decode worker generates tokens autoregressively, one per iteration. This is memory-bandwidth-bound (each iteration reads the full model weights but produces only one token).
+\end{enumerate}
+
+The \texttt{PrefillRouter} (in \texttt{dynamo-llm}'s \texttt{kv\_router::prefill\_router} module) handles the prefill-to-decode handoff, using the \texttt{BlockManager} to coordinate NIXL transfers.
+
+\subsection{Stage 6: Response Streaming}
+
+Each generated token flows back through the pipeline in reverse. The worker wraps each token in an \texttt{Annotated<LLMEngineOutput>}---a protocol wrapper that carries both the token data and metadata (timing information, finish reason, usage statistics). The stream of annotated outputs travels back through the transport layer to the frontend, which converts each into a Server-Sent Event conforming to the OpenAI streaming format:
+
+\begin{verbatim}
+data: {"id":"chatcmpl-abc","choices":[{"delta":{"content":" world"}}]}
+\end{verbatim}
+
+When the model emits a stop token or reaches the maximum generation length, the stream closes with a \texttt{[DONE]} sentinel. The worker's \texttt{RequestGuard} (a drop guard in the \texttt{KvPushRouter}) fires, recording latency metrics, calling \texttt{free()} on the allocated KV cache blocks in the radix tree, and updating the worker's load statistics.
+
+\begin{notebox}
+The entire journey---from HTTP request to first token---is called \emph{time to first token} (TTFT). The time between subsequent tokens is the \emph{inter-token latency} (ITL). These two metrics dominate user-perceived quality: TTFT determines how long the user waits before seeing any output, while ITL determines the speed of the streaming response. Dynamo's architecture is optimized to minimize both---KV-aware routing reduces TTFT by maximizing cache hits, while disaggregated serving allows decode workers to specialize for low ITL.
+\end{notebox}
+
+% --- Request flow diagram ---
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+    node distance=1.8cm and 2.2cm,
+    box/.style={rectangle, draw, rounded corners, minimum width=2.8cm, minimum height=0.9cm, align=center, font=\small},
+    arrow/.style={->, thick, >=stealth},
+    label/.style={font=\scriptsize, midway, above},
+    labelbelow/.style={font=\scriptsize, midway, below}
+]
+  % Nodes
+  \node[box] (client) {Client};
+  \node[box, right=of client] (frontend) {Frontend\\{\scriptsize(axum HTTP)}};
+  \node[box, right=of frontend] (preproc) {Preprocessor\\{\scriptsize(template + tokenizer)}};
+  \node[box, below=1.5cm of preproc] (router) {Router\\{\scriptsize(KV-aware)}};
+  \node[box, left=of router] (worker) {Worker\\{\scriptsize(vLLM/SGLang/TRT)}};
+  \node[box, left=of worker] (response) {SSE Stream};
+
+  % Arrows
+  \draw[arrow] (client) -- (frontend) node[label] {HTTP/JSON};
+  \draw[arrow] (frontend) -- (preproc) node[label] {in-process};
+  \draw[arrow] (preproc) -- (router) node[label, right] {token IDs};
+  \draw[arrow] (router) -- (worker) node[labelbelow] {TCP/NATS};
+  \draw[arrow] (worker) -- (response) node[labelbelow] {tokens};
+  \draw[arrow] (response) -- (client) node[label, left] {SSE};
+\end{tikzpicture}
+\caption{The journey of a single inference request through Dynamo's pipeline. The hot path (router, codec, transport) is Rust; the inference engine is Python.}
+\label{fig:request-journey}
+\end{figure}
+
+
+%% ============================================================
+\section{Service Discovery}
+\label{sec:architecture:discovery}
+%% ============================================================
+
+The request journey above assumed the router already knew which workers exist and where they are. But in a dynamic cluster---where workers start, crash, and scale independently---this knowledge cannot be hardcoded. How does the router find its workers? That is the job of service discovery.
+
+\marginnote{\emph{etcd:} a distributed key-value store used for service registration and configuration. NATS JetStream provides an alternative KV store backend for simpler deployments.}%
+Dynamo operates as a fleet of independently deployed services: frontend servers, routers, prefill workers, decode workers, and auxiliary services. Each must find and communicate with the others without hardcoded addresses. Dynamo solves this with a \textbf{pluggable discovery system} defined by the \texttt{Discovery} trait in \texttt{dynamo-runtime}'s \texttt{discovery} module.
+
+\subsection{The Discovery Trait}
+
+The \texttt{Discovery} trait (at \texttt{lib/runtime/src/discovery/mod.rs}) defines five operations:
+
+\begin{enumerate}
+  \item \texttt{instance\_id()} --- returns the unique identifier for this worker (typically an etcd lease ID or a generated hash).
+  \item \texttt{register(spec)} --- publishes a \texttt{DiscoverySpec} (endpoint, model card, or event channel) to the discovery plane.
+  \item \texttt{unregister(instance)} --- removes a previously registered instance.
+  \item \texttt{list(query)} --- returns a one-time snapshot of registered instances matching a query.
+  \item \texttt{list\_and\_watch(query)} --- returns a \emph{stream} of \texttt{Discovery\-Event::Added} and \texttt{Discovery\-Event::Removed} events, enabling reactive updates.
+\end{enumerate}
+
+Three backends implement this trait:
+
+\begin{itemize}
+  \item \textbf{\texttt{KVStoreDiscovery}}: uses an abstract key-value store interface (\texttt{kv::Manager}), which is backed by either etcd or NATS JetStream depending on configuration. This is the primary backend for standalone deployments. Keys are hierarchically structured:
+
+\smallskip
+\texttt{v1/instances/\{namespace\}/\{component\}/\{endpoint\}/\{instance\_id\}}
+\smallskip
+
+  \item \textbf{\texttt{KubeDiscoveryClient}}: uses the Kubernetes API server (via the \texttt{kube} crate) for service discovery in cloud-native deployments. Workers are discovered by watching Kubernetes EndpointSlice resources with appropriate labels.
+
+  \item \textbf{\texttt{MockDiscovery}}: an in-memory implementation for testing, using a \texttt{SharedMockRegistry}.
+\end{itemize}
+
+\subsection{Registration and Leasing}
+
+When a worker starts, it creates an etcd lease---a time-limited grant that must be periodically renewed. The lease ID becomes the worker's \texttt{instance\_id}. The worker then registers itself by writing a \texttt{DiscoverySpec::Endpoint} to the discovery plane, specifying its namespace, component name, endpoint name, and transport address.
+
+\marginnote{etcd leases have a configurable TTL (time-to-live). If a worker crashes without cleanly deregistering, its lease expires after the TTL, and all keys associated with that lease are automatically deleted.}%
+
+The etcd client (\texttt{lib/runtime/src/transports/etcd.rs}) maintains a dedicated Tokio runtime for lease keep-alive tasks, separate from the main application runtime. This isolation prevents a busy main runtime from starving the keep-alive task, which would cause the lease to expire and the worker to be deregistered.
+
+\begin{verbatim}
+// From etcd.rs: Exclusive runtime for lease keep-alive
+// WARNING: Do not await on main runtime from this
+// runtime or deadlocks may occur
+rt: Arc<tokio::runtime::Runtime>,
+\end{verbatim}
+
+\subsection{Dynamic Fleet Updates}
+
+The router uses \texttt{list\_and\_watch} to subscribe to worker registration events. When a new worker registers, the router receives a \texttt{DiscoveryEvent::Added} containing the worker's transport address and model configuration. The router adds the worker to its routing table and, in KV-aware mode, begins subscribing to the worker's KV cache events to populate the radix tree.
+
+When a worker departs---either cleanly (calling \texttt{shutdown()}, which immediately deletes its keys) or by crashing (lease expiry after TTL)---the router receives a \texttt{DiscoveryEvent::Removed} and evicts all entries for that worker from the radix tree and routing table.
+
+This design has a critical property: \textbf{no component needs to be restarted when the fleet changes}. Workers, routers, and frontends can be independently scaled up and down, and the changes propagate through the discovery plane within seconds.
+
+\subsection{Hierarchical Namespacing}
+
+Dynamo organizes discovery into a three-level hierarchy:
+
+\begin{center}
+\texttt{Namespace} $\rightarrow$ \texttt{Component} $\rightarrow$ \texttt{Endpoint}
+\end{center}
+
+A \texttt{Namespace} groups related components (e.g., a particular model deployment). A \texttt{Component} represents a logical service (e.g., ``SmartRouter'' or ``VllmWorker''). An \texttt{Endpoint} is a specific network-accessible function within a component (e.g., ``generate'' or ``embeddings''). This hierarchy enables precise discovery queries: a router can watch for all endpoints in a namespace, or just endpoints of a specific component type.
+
+\begin{insightbox}
+The discovery hierarchy maps directly to the scaling model. A Kubernetes Horizontal Pod Autoscaler watches metrics for a specific component and scales that component's pods independently. The discovery plane propagates the change to all interested parties. This is why Dynamo can disaggregate prefill and decode workers: each is a separate component with independent scaling policies.
+\end{insightbox}
+
+
+%% ============================================================
+\section{Communication Planes}
+\label{sec:architecture:comms}
+%% ============================================================
+
+Service discovery tells components \emph{where} their peers are. But discovering an address is useless without a way to talk to it. Dynamo's components exchange three fundamentally different kinds of data---small control messages, serialized inference requests, and multi-gigabyte GPU tensors---and no single transport serves all three well. This section examines how Dynamo solves each.
+
+A distributed inference system must move very different kinds of data between its components: small control messages, medium-sized serialized requests, and enormous GPU tensors. Dynamo uses distinct communication mechanisms for each, choosing the right tool for the right job.
+
+\subsection{The Request Plane}
+
+The request plane carries inference requests from routers to workers and responses back. It supports three transport modes, configured per-component:
+
+\marginnote{\emph{NATS:} a lightweight, high-performance messaging system supporting publish/subscribe, request/reply, and queue groups. JetStream adds persistence and at-least-once delivery.}%
+\textbf{NATS} serves as the default request transport. When using NATS, the router publishes a serialized request to a subject that the target worker subscribes to. NATS's built-in queue groups provide automatic load balancing when multiple workers subscribe to the same subject. The NATS client (\texttt{lib/runtime/src/transports/nats.rs}) wraps the \texttt{async-nats} crate and supports JetStream for durable messaging, authentication via tokens, NKeys, or credential files, and TLS.
+
+\textbf{TCP with TwoPartCodec} provides the highest-performance request path. Persistent TCP connections between routers and workers avoid the overhead of NATS's pub/sub routing. The \texttt{TwoPartCodec} (\texttt{lib/\allowbreak runtime/\allowbreak src/\allowbreak pipeline/\allowbreak network/\allowbreak codec/\allowbreak two\_part.rs}) frames each message with a 24-byte preamble containing header length, body length, and an xxHash checksum (Chapter~\ref{ch:codecs}). A companion \texttt{TcpRequestMessage} codec adds endpoint-path routing and trace headers, enabling a single TCP connection to multiplex requests to different endpoints on the same worker.
+
+\textbf{HTTP/2} serves as the external-facing protocol and an internal transport option. The frontend exposes HTTP endpoints for client requests, and workers can optionally advertise HTTP addresses for inter-service communication. This mode sacrifices raw throughput for compatibility with standard load balancers and observability tools.
+
+\subsection{The Event Plane}
+
+\marginnote{The event plane was designed to decouple KV cache updates from the request path. Workers publish cache events asynchronously; routers consume them at their own pace.}%
+Separately from the request plane, Dynamo has an \textbf{event plane} for asynchronous pub/sub messaging, primarily used for KV cache events and metrics. The event plane (\texttt{lib/\allowbreak runtime/\allowbreak src/\allowbreak transports/\allowbreak event\_plane/}) is transport-agnostic, supporting two backends:
+
+\begin{itemize}
+  \item \textbf{NATS Core}: lightweight pub/sub using NATS subjects. The default, with JSON serialization.
+  \item \textbf{ZMQ (ZeroMQ)}: direct TCP pub/sub, using MessagePack (\texttt{rmp-serde}) for compact binary serialization. Preferred when NATS is unavailable or when lower latency is required.
+\end{itemize}
+
+The transport is selected via the \texttt{DYN\_EVENT\_PLANE} environment variable (\texttt{"nats"} or \texttt{"zmq"}). Each event is wrapped in a \texttt{Frame} with a version byte and sequence number for ordering, enabling subscribers to detect gaps.
+
+Workers use the event plane to publish \texttt{RouterEvent} messages---notifications about KV cache block allocations and deallocations. Routers subscribe to these events and update their radix trees accordingly. This is how the router maintains an up-to-date view of what each worker has cached, without querying workers synchronously on the request path.
+
+\begin{whynotbox}{Why separate event and request planes?}
+Both the event plane and the request plane move data between the same components (routers and workers). Why not send KV cache events as sidecar metadata on the request channel?
+
+\textbf{Different delivery semantics.} Requests are point-to-point: one request goes to one worker. KV cache events are fan-out: one worker's cache update must reach \emph{every} router in the cluster. Pub/sub (the event plane) is designed for fan-out; request/reply channels are not. Multiplexing both patterns onto a single transport would require the request channel to implement pub/sub routing internally---reimplementing what NATS Core and ZMQ already provide.
+
+\textbf{Different failure modes.} If the event plane falls behind or drops messages, routers have a slightly stale view of cache state---they route suboptimally but correctly. If the request plane drops messages, user requests are lost. Separating the planes means event delivery can be best-effort (NATS Core, no persistence) while request delivery can use stronger guarantees (NATS JetStream, TCP with checksums) without one constraining the other.
+
+\textbf{Different throughput profiles.} A single worker may generate thousands of KV cache events per second (one per block allocation) but handle only tens of inference requests per second. Mixing high-frequency telemetry with latency-sensitive requests on the same channel risks head-of-line blocking, where a burst of cache events delays request dispatch.
+\end{whynotbox}
+
+\subsection{The GPU Data Plane}
+
+For GPU-to-GPU data transfer---specifically, KV cache migration between disaggregated prefill and decode workers---Dynamo uses two specialized libraries:
+
+\marginnote{\emph{RDMA (Remote Direct Memory Access):} a networking technique that allows one machine to read/write another machine's memory without involving either CPU, achieving near-wire-speed transfers.}%
+\textbf{NIXL} (NVIDIA Interconnect eXchange Library) handles remote GPU memory transfers. The \texttt{BlockManager} in \texttt{dynamo-llm}'s \texttt{block\_manager} module registers GPU memory regions with a NIXL agent, which can then transfer blocks directly between GPUs across nodes using RDMA (Remote Direct Memory Access) or NVLink, bypassing the CPU entirely. The \texttt{nixl-sys} crate provides Rust FFI bindings to the NIXL C++ library.
+
+\textbf{NCCL} (NVIDIA Collective Communications Library) handles tensor parallelism communication within a single inference step---specifically, the \texttt{all-reduce} operations required when a model is sharded across multiple GPUs within a node.
+
+\begin{insightbox}
+The choice of three communication planes reflects a fundamental design principle: \emph{match the transport to the data}. Control messages (discovery events, cache updates) need reliability and fan-out, so they use pub/sub. Inference requests need low latency and direct addressing, so they use point-to-point TCP. GPU tensors need maximal bandwidth and zero CPU involvement, so they use RDMA. Using a single transport for all three would either sacrifice performance on the hot path or sacrifice reliability on the control path.
+\end{insightbox}
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+\textbf{Plane} & \textbf{Data} & \textbf{Transport} & \textbf{Serialization} \\
+\midrule
+Request & Inference requests/responses & NATS / TCP / HTTP & JSON / TwoPartCodec \\
+Event & KV cache events, metrics & NATS Core / ZMQ & JSON / MessagePack \\
+GPU Data & KV cache blocks, all-reduce & NIXL / NCCL & Raw GPU memory \\
+External & Client API & HTTP + SSE & JSON (OpenAI format) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+
+%% ============================================================
+\section{The Rust-Python Bridge (PyO3)}
+\label{sec:architecture:pyo3}
+%% ============================================================
+
+The previous sections described the router, codec, and transports---all implemented in Rust. But the inference engines that actually run on the GPU are Python libraries. How do these two worlds connect? The answer is PyO3, and understanding this bridge is essential for understanding both Dynamo's performance characteristics and its failure modes.
+
+\marginnote{\emph{PyO3:} a Rust library for bidirectional interop with Python, used to build native Python extension modules.}%
+Dynamo's hot path---the router, codec, radix tree, and frontend---is written in Rust for the performance reasons discussed in Chapter~1. But the inference engines it orchestrates (vLLM, SGLang, TensorRT-LLM) are Python-first, and operator-facing configuration and pipeline composition is done in Python. The bridge between these two worlds is \textbf{PyO3}, and understanding its architecture reveals important design constraints.
+
+\subsection{The Architectural Boundary}
+
+The PyO3 bridge follows a clear separation. Rust owns the \emph{data plane}: all network I/O, serialization, routing decisions, data structure operations (radix tree, block hasher), and request lifecycle management happen in Rust. Python owns the \emph{control plane}: model configuration, inference engine initialization, pipeline composition (connecting components together), and the actual GPU computation (via the inference engines).
+
+The boundary is crossed in two directions:
+
+\textbf{Python $\rightarrow$ Rust} (at startup and configuration time): Python code creates Rust objects---a \texttt{DistributedRuntime}, \texttt{Component}, \texttt{Namespace}---by calling into PyO3-wrapped constructors. It configures the router mode, KV router settings, and transport addresses. It registers inference engines by wrapping a Python async generator in a \texttt{PythonAsyncEngine}.
+
+\textbf{Rust $\rightarrow$ Python} (per-request): When a request reaches a worker, Rust invokes the registered Python engine's \texttt{generate} method, passing the preprocessed request. The engine returns a Python async generator, which Rust consumes token-by-token using \texttt{pyo3-async-runtimes}'s stream bridging.
+
+\subsection{The PythonAsyncEngine}
+
+The key bridging type is \texttt{PythonAsyncEngine} (in \texttt{lib/bindings/python/rust/engine.rs}), which implements Rust's \texttt{AsyncEngine} trait by wrapping a Python callable. When Rust calls the engine, it:
+
+\begin{enumerate}
+\marginnote{\emph{GIL (Global Interpreter Lock):} a mutex in CPython that allows only one thread to execute Python bytecode at a time, preventing true parallelism in pure Python code.}%
+  \item Acquires the Python GIL (Global Interpreter Lock).
+  \item Serializes the request from Rust types to Python objects using \texttt{pythonize} (a serde-to-Python bridge).
+  \item Calls the Python generator function, releasing the GIL while awaiting the next token.
+  \item Deserializes each yielded Python object back to Rust types using \texttt{depythonize}.
+  \item Feeds the deserialized token into the Rust response stream.
+\end{enumerate}
+
+\begin{notebox}
+The GIL is Python's mechanism for ensuring only one thread executes Python bytecode at a time. Dynamo carefully manages GIL acquisition: it holds the GIL only during the brief moments of calling into Python and converting objects. Between tokens---while the GPU is computing---the GIL is released, allowing other Python threads to run. The PyO3 binding uses the \texttt{abi3-py310} stable ABI, ensuring compatibility across Python versions without recompilation.
+\end{notebox}
+
+\subsection{Build Tooling: Maturin}
+
+The \texttt{lib/bindings/python} directory contains a standalone Cargo workspace (separate from the main workspace to avoid PyO3 extension module build conflicts). \texttt{Maturin}, a Rust-to-Python build tool, compiles this crate into a Python wheel named \texttt{dynamo.\_core}. From the Python side, the Rust components appear as native Python classes with type hints generated by PyO3's \texttt{experimental-inspect} feature.
+
+The Python package at \texttt{components/src/dynamo/} imports these Rust bindings and uses them to compose pipelines:
+
+\begin{verbatim}
+from dynamo._core import DistributedRuntime, Component
+from dynamo._core import PythonAsyncEngine
+
+runtime = DistributedRuntime(...)
+component = Component(runtime, "VllmWorker")
+engine = PythonAsyncEngine(my_generate_fn, loop)
+component.add_engine("generate", engine)
+\end{verbatim}
+
+\subsection{What Runs Where}
+
+\begin{whynotbox}{Why not write the entire system in Python?}
+Python dominates the ML ecosystem. The inference engines are Python. The model configurations are Python. The operator-facing APIs are Python. Why add the complexity of a second language and a cross-language bridge?
+
+\textbf{Tail latency.} Python's garbage collector runs unpredictably, and the GIL serializes all CPU-bound Python threads. In a serving system handling thousands of concurrent requests, a 10ms GC pause on the router means 10ms of added latency for \emph{every} request in the queue. Rust has no GC and no GIL---its async runtime (\texttt{tokio}) schedules tasks cooperatively across all CPU cores. The difference is measurable: Discord reported 2--5$\times$ latency improvements after migrating a similar service from a GC'd language to Rust.
+
+\textbf{Concurrency model.} The radix tree is read by multiple router tasks concurrently while being updated by event plane subscribers. In Python, the GIL makes true parallel reads impossible without multiprocessing (which means separate memory spaces and expensive IPC). In Rust, a \texttt{RwLock}-protected data structure allows unlimited parallel readers with zero copying between processes.
+
+\textbf{Serialization cost.} The \texttt{TwoPartCodec} processes every byte of every inter-service message. In benchmarks, Rust's \texttt{serde} framework serializes and deserializes 10--100$\times$ faster than Python's \texttt{json} module or \texttt{pickle}. For a codec that runs on every request and every token response, this difference directly impacts throughput.
+
+The cost of the two-language approach is integration complexity---and, as Chapter~\ref{ch:findings} documents, bugs at the language boundary. But the performance gains on the hot path are large enough that every major inference serving system (vLLM, SGLang, TensorRT-LLM) follows the same pattern: a fast core in C++/Rust with a Python interface layer.
+\end{whynotbox}
+
+The division is not arbitrary---it follows the performance profile of each operation:
+
+\begin{center}
+\begin{tabular}{llp{7cm}}
+\toprule
+\textbf{Operation} & \textbf{Language} & \textbf{Rationale} \\
+\midrule
+HTTP server, SSE streaming & Rust & Thousands of concurrent connections; GC pauses unacceptable \\
+TwoPartCodec encode/decode & Rust & Called per-message on the hot path; must be zero-copy \\
+Radix tree operations & Rust & Concurrent reads from multiple router tasks; lock-free where possible \\
+Block hashing (xxHash) & Rust & CPU-intensive; benefits from SIMD \\
+Chat template rendering & Rust (minijinja) & Per-request but fast; avoids Python GIL \\
+Tokenization & Rust (HF tokenizers) & Per-request; the Rust core is 43$\times$ faster than pure Python \\
+Model configuration & Python & One-time at startup; leverages Hugging Face ecosystem \\
+Inference engine & Python & GPU compute dominates; language overhead negligible \\
+Pipeline composition & Python & Operator ergonomics; configuration, not performance \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insightbox}
+The PyO3 boundary is crossed \emph{per-request}, not \emph{per-token}. Once a Python engine's generator is started, tokens flow back through the Rust-Python bridge as individual yield points. But the expensive part---GPU kernel launches, attention computation, KV cache management---happens entirely within the Python inference engine's C++/CUDA runtime, not in Python bytecode. The GIL is a bottleneck only for the brief moments of object conversion, not for computation.
+\end{insightbox}
+
+
+%% ============================================================
+\section{Component Map}
+\label{sec:architecture:map}
+%% ============================================================
+
+We have now traced a request through the system, examined how components find each other, how they communicate, and how Rust and Python interoperate. This section provides a comprehensive reference map of every major component, its location in the codebase, and its role---useful both as a reading guide for the remaining chapters and as a reference when exploring the source code.
+
+Dynamo's codebase is organized into Rust library crates (under \texttt{lib/}), Python components (under \texttt{components/src/dynamo/}), and deployment infrastructure (under \texttt{deploy/}). The following table maps every major component to its crate, language, and role.
+
+\subsection{Rust Crates (\texttt{lib/})}
+
+\begin{center}
+\begin{tabular}{p{3.8cm}p{9cm}}
+\toprule
+\textbf{Crate} & \textbf{Role} \\
+\midrule
+\texttt{dynamo-runtime} & Core distributed runtime: service discovery, transports (NATS, TCP, etcd), pipeline framework, metrics, health checking, the \texttt{Component}/\texttt{Endpoint}/\texttt{Namespace} abstraction, event plane, and the \texttt{TwoPartCodec} \\
+\texttt{dynamo-llm} & LLM-specific orchestration: HTTP frontend, preprocessor (chat templates, tokenizers), KV-aware routing integration, block manager (NIXL), gRPC service, model cards, LoRA adapter management, media processing \\
+\texttt{dynamo-kv-router} & KV cache indexing: radix tree, concurrent radix tree, positional indexer, worker selector, scheduler queue, event sink, ZMQ wire protocol. The algorithmic core of Chapter~\ref{ch:kvrouter} \\
+\texttt{dynamo-tokens} & Token block operations: block hashing, radix hashing, sequence hash computation. The subject of Chapter~\ref{ch:tokens} \\
+\texttt{dynamo-parsers} & Streaming output parsers for 15+ model families: tool call extraction, JSON/XML parsing, stop-string detection. The subject of Chapter~\ref{ch:findings} \\
+\texttt{dynamo-memory} & GPU and system memory management: CUDA device memory, pinned host memory, NIXL integration, disk storage, NUMA-aware allocation \\
+\texttt{dynamo-config} & Configuration management: environment variable resolution, configuration file parsing \\
+\texttt{dynamo-async-openai} & Fork of the \texttt{async-openai} crate with Dynamo-specific extensions (BYOT---bring your own transport) \\
+\texttt{dynamo-mocker} & Mock inference engine for testing: generates deterministic token streams without GPU \\
+\texttt{dynamo-bench} & Benchmarking utilities shared across crates \\
+\texttt{kvbm-*} & Four crates (\texttt{common}, \texttt{kernels}, \texttt{logical}, \texttt{physical}) implementing the KV Block Manager's layered architecture \\
+\texttt{velo-events} & Event logging and telemetry \\
+\texttt{dynamo-py3} & PyO3 bindings: the \texttt{\_core} native module that bridges Rust into Python \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Python Components (\texttt{components/src/dynamo/})}
+
+\begin{center}
+\begin{tabular}{p{3.2cm}p{9.5cm}}
+\toprule
+\textbf{Component} & \textbf{Role} \\
+\midrule
+\texttt{frontend} & Python frontend service that initializes the Rust HTTP server, configures model endpoints, and manages the lifecycle of the serving pipeline \\
+\texttt{router} & Python router component that configures and starts the Rust KV-aware router with appropriate settings \\
+\texttt{planner} & Auto-scaling planner: monitors latency/throughput metrics and decides when to scale prefill and decode worker pools (both aggregated and disaggregated modes) \\
+\texttt{global\_planner} & Cluster-wide planning for multi-model deployments \\
+\texttt{global\_router} & Cluster-wide routing across multiple model deployments \\
+\texttt{vllm} & vLLM engine integration: wraps vLLM's async generation as a Dynamo engine \\
+\texttt{sglang} & SGLang engine integration \\
+\texttt{trtllm} & TensorRT-LLM engine integration \\
+\texttt{mocker} & Mock backend for testing without GPUs \\
+\texttt{profiler} & Performance profiling utilities \\
+\texttt{common} & Shared utilities across Python components \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Deployment Infrastructure (\texttt{deploy/})}
+
+\begin{center}
+\begin{tabular}{p{3.2cm}p{9.5cm}}
+\toprule
+\textbf{Component} & \textbf{Role} \\
+\midrule
+\texttt{helm} & Helm charts for Kubernetes deployment of Dynamo services \\
+\texttt{operator} & Kubernetes operator (Go) for automated deployment and scaling \\
+\texttt{discovery} & Kubernetes-native service discovery integration \\
+\texttt{docker-compose.yml} & Local development deployment with etcd, NATS, and worker containers \\
+\texttt{nats-server.conf} & NATS server configuration (JetStream enabled, memory/file storage limits) \\
+\texttt{observability} & Prometheus, Grafana, and OpenTelemetry configuration for monitoring \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{notebox}
+The component map reveals Dynamo's polyglot nature: Rust for the hot path, Python for ML integration, Go for Kubernetes infrastructure, and C++ (via NIXL/NCCL) for GPU memory transfers. Each language is used where its strengths---performance, ecosystem, tooling---best match the component's requirements. The cost is integration complexity at each language boundary, which is exactly where many of the bugs in Chapter~\ref{ch:findings} reside: UTF-8 boundary violations at the Rust string layer, integer overflow in the binary codec, and regex caching issues where Python configuration meets Rust execution.
+\end{notebox}
+
+\subsection{Dependency Graph}
+
+The crate dependency structure forms a layered architecture:
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=1.2cm,
+    crate/.style={rectangle, draw, rounded corners, minimum width=3cm, minimum height=0.7cm, align=center, font=\small},
+    arrow/.style={->, thick, >=stealth}
+]
+  % Bottom layer
+  \node[crate] (config) {\texttt{dynamo-config}};
+  \node[crate, right=2cm of config] (tokens) {\texttt{dynamo-tokens}};
+
+  % Middle layer
+  \node[crate, above=of config] (runtime) {\texttt{dynamo-runtime}};
+  \node[crate, right=2cm of runtime] (kvrouter) {\texttt{dynamo-kv-router}};
+
+  % Upper layer
+  \node[crate, above=1.5cm of runtime, xshift=1.5cm] (llm) {\texttt{dynamo-llm}};
+
+  % Top layer
+  \node[crate, above=of llm] (py3) {\texttt{dynamo-py3}};
+
+  % Arrows
+  \draw[arrow] (runtime) -- (config);
+  \draw[arrow] (kvrouter) -- (runtime);
+  \draw[arrow] (kvrouter) -- (tokens);
+  \draw[arrow] (llm) -- (runtime);
+  \draw[arrow] (llm) -- (kvrouter);
+  \draw[arrow] (py3) -- (llm.north);
+  \draw[arrow, dashed] (py3) -- (runtime.north west);
+\end{tikzpicture}
+\end{center}
+
+\texttt{dynamo-config} sits at the base, providing configuration to all crates. \texttt{dynamo-runtime} builds on it with the distributed runtime (discovery, transports, pipeline framework). \texttt{dynamo-kv-router} depends on the runtime for communication and on \texttt{dynamo-tokens} for block hashing. \texttt{dynamo-llm} integrates everything: it depends on the runtime, the KV router, the token crate, the memory crate, and the parser crate. Finally, \texttt{dynamo-py3} sits at the top, exposing \texttt{dynamo-llm} and \texttt{dynamo-runtime} to Python.
+
+
+%% ============================================================
+\section{Summary}
+\label{sec:architecture:summary}
+%% ============================================================
+
+\begin{itemize}
+  \item A request's journey through Dynamo touches six stages: \textbf{HTTP ingress} (axum frontend), \textbf{preprocessing} (chat template + tokenization), \textbf{routing} (KV-aware worker selection), \textbf{dispatch} (TCP/NATS/HTTP transport), \textbf{inference} (vLLM/SGLang/TRT-LLM), and \textbf{streaming} (SSE output with per-token lifecycle management).
+
+  \item \textbf{Service discovery} is pluggable, with backends for etcd/NATS JetStream KV stores and Kubernetes. The \texttt{Discovery} trait provides \texttt{list\_and\_watch} semantics that enable reactive fleet updates without restarts.
+
+  \item Three \textbf{communication planes}---request (NATS/TCP/HTTP), event (NATS Core/ZMQ), and GPU data (NIXL/NCCL)---serve different performance and reliability profiles. Each is chosen to match its data type.
+
+  \item The \textbf{PyO3 bridge} separates Rust (data plane) from Python (control plane), crossing the boundary per-request with lightweight serialization. The GIL is held only during brief object conversion, not during GPU computation.
+
+  \item Dynamo's \textbf{crate architecture} is layered: \texttt{dynamo-config} $\rightarrow$ \texttt{dynamo-runtime} $\rightarrow$ \texttt{dynamo-kv-router} / \texttt{dynamo-tokens} $\rightarrow$ \texttt{dynamo-llm} $\rightarrow$ \texttt{dynamo-py3}. Each layer has a well-defined responsibility boundary.
+
+  \item Dynamo is a \textbf{polyglot system}: Rust, Python, Go, and C++ each handle the components best suited to their strengths, with integration complexity concentrated at language boundaries.
+\end{itemize}
+
+\bigskip
+\begin{center}\rule{0.5\linewidth}{0.4pt}\end{center}
+\bigskip
+
+With the architecture mapped, we can now zoom into the component that makes Dynamo's routing unique: the KV-aware radix tree that decides which GPU should handle each request.
+
+\bigskip
+\noindent\textbf{Check Your Understanding}
+
+\medskip
+\noindent\emph{These questions are answerable from this chapter alone.}
+
+\begin{enumerate}
+  \item Trace a request through Dynamo from HTTP ingress to the first generated token. Name every component and crate it touches, and identify which are Rust and which are Python.
+
+  \item Why does Dynamo propagate all requests internally as streaming, even when the client requests \texttt{stream=false}? What design benefit does this provide?
+
+  \item Explain the three communication planes (request, event, GPU data). For each, name the transport options and the type of data it carries. Why would using a single transport for all three be suboptimal?
+
+  \item What happens when a GPU worker crashes unexpectedly? Trace the sequence of events through the etcd lease system, the discovery plane, and the router's radix tree.
+
+  \item In a disaggregated configuration, the request touches two different GPU workers (prefill and decode). What data must be transferred between them, what protocol is used, and why is CPU involvement avoided?
+
+  \item Describe the role of the \texttt{PythonAsyncEngine}. When is the GIL acquired and released during token generation? Why is GIL contention not a bottleneck for inference throughput?
+
+  \item The \texttt{Discovery} trait has both a \texttt{list()} method and a \texttt{list\_and\_watch()} method. Why are both needed? In what scenarios would you use each?
+
+  \item Look at the crate dependency graph. Why does \texttt{dynamo-kv-router} depend on \texttt{dynamo-tokens} but not on \texttt{dynamo-llm}? What architectural principle does this reflect?
+\end{enumerate}
+
+\bigskip
+\noindent\textbf{Answers}
+
+\medskip
+
+\begin{enumerate}
+  \item The request enters the \textbf{axum HTTP frontend} (\texttt{dynamo-llm}, Rust), which validates JSON and checks model registration. It passes to the \textbf{preprocessor} (\texttt{dynamo-llm}, Rust: minijinja for chat templates, HF tokenizers for tokenization). The token sequence goes to the \textbf{router} (\texttt{dynamo-kv-router} for radix tree lookup, \texttt{dynamo-tokens} for block hashing, both Rust). The router dispatches via the \textbf{transport layer} (\texttt{dynamo-runtime}, Rust: TCP/NATS). The worker receives the request and invokes the \textbf{inference engine} (Python: vLLM/SGLang/TRT-LLM) via \texttt{PythonAsyncEngine} (PyO3 bridge in \texttt{dynamo-py3}, Rust$\leftrightarrow$Python). The first token streams back through the transport to the frontend.
+
+  \item By treating all requests as streaming internally, the entire downstream pipeline handles a single pattern (async stream of token fragments). This eliminates duplicate code paths for streaming vs.\ non-streaming, reducing complexity and the associated bug surface. Non-streaming responses are simply the aggregation of a complete stream at the frontend boundary.
+
+  \item \textbf{Request plane}: NATS, TCP (TwoPartCodec), or HTTP/2; carries inference requests and responses; optimized for low-latency point-to-point communication. \textbf{Event plane}: NATS Core or ZMQ; carries KV cache events and metrics; optimized for async fan-out pub/sub. \textbf{GPU data plane}: NIXL (RDMA) or NCCL; carries KV cache blocks and all-reduce tensors; optimized for maximal bandwidth with zero CPU involvement. A single transport would force a compromise: pub/sub systems add routing overhead to the request path, point-to-point TCP cannot do fan-out efficiently, and neither can move GPU memory without CPU copies.
+
+  \item When a worker crashes: (1) its etcd lease keep-alive stops; (2) after the TTL expires, etcd deletes all keys associated with the lease; (3) the router's \texttt{list\_and\_watch} stream emits a \texttt{DiscoveryEvent::Removed}; (4) the router removes the worker from its routing table; (5) all entries for that worker's ID are evicted from the radix tree; (6) subsequent requests are routed only to remaining healthy workers. Any in-flight requests to the crashed worker will time out and may be retried.
+
+  \item The prefill worker computes the \textbf{KV cache} (key and value tensors for all layers and all input tokens). This cache is transferred to the decode worker via \textbf{NIXL}, which performs direct GPU-to-GPU memory transfer using RDMA. CPU involvement is avoided because the KV cache is large (gigabytes for long contexts) and copying it through CPU memory would add unacceptable latency and consume PCIe bandwidth that the GPU needs for inference.
+
+  \item \texttt{PythonAsyncEngine} implements Rust's \texttt{AsyncEngine} trait by wrapping a Python async generator. The GIL is acquired briefly to (a) call the Python generator function and (b) convert each yielded Python object to Rust types via \texttt{depythonize}. Between yield points---while the GPU is executing inference kernels---the GIL is \emph{released}. GIL contention is not a bottleneck because GPU kernel execution (the dominant cost) happens in C++/CUDA land outside the GIL, and the conversion overhead is microseconds compared to milliseconds of GPU computation per token.
+
+  \item \texttt{list()} returns a one-time snapshot, useful at startup to bootstrap the routing table with all currently registered workers. \texttt{list\_and\_watch()} returns a continuous stream of add/remove events, used by long-running components (routers, frontends) to react to fleet changes in real time. Using only \texttt{list()} would miss dynamic changes; using only \texttt{list\_and\_watch()} would miss instances that registered before the watch started (race condition).
+
+  \item \texttt{dynamo-kv-router} depends on \texttt{dynamo-tokens} because it needs block hash computation to map token sequences to radix tree entries. It does \emph{not} depend on \texttt{dynamo-llm} because the router's indexing logic is model-agnostic---it operates on abstract block hashes and worker IDs, not on model-specific types. This reflects the \textbf{dependency inversion principle}: the high-level orchestration crate (\texttt{dynamo-llm}) depends on the low-level algorithmic crate (\texttt{dynamo-kv-router}), not the reverse. This keeps the router testable and reusable independently of any specific inference engine.
+\end{enumerate}

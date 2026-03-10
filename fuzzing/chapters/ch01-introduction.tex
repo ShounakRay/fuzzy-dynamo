@@ -1,0 +1,209 @@
+\chapter{Introduction}
+
+\section{What Happens When You Hit Send}
+
+You type a message into a chat interface and press \emph{Send}. An HTTP request leaves your browser, carrying a JSON payload with your prompt. A \emph{frontend server} receives it and hands it to a \emph{preprocessor}, which applies a chat template and feeds your text through a \emph{tokenizer}---an algorithm that splits your text into integer-coded sub-word pieces called \emph{tokens}. The resulting sequence of token IDs is forwarded to a \emph{router}, which hashes them into fixed-size blocks and queries a \emph{radix tree}---a prefix data structure that maps block hashes to cached GPU workers. The router selects the GPU whose memory already contains the most relevant cached computation from prior requests. A custom \emph{binary codec} serializes the token sequence and ships it over TCP to the chosen GPU worker. There, an inference engine streams the model's billions of already-resident parameters from high-bandwidth memory, runs the \emph{transformer}'s attention mechanism against the input, and produces a single new token. That token streams back through the system as a Server-Sent Event. The process repeats---one token at a time---until the model emits a stop signal.
+
+Every italicized term above is a promise. Over the next nine chapters, we will explain each one from scratch, building from the linear algebra inside a single GPU all the way out to the distributed system that orchestrates hundreds of them.
+
+
+\section{What Dynamo Is}
+
+NVIDIA Dynamo is an open-source, distributed inference-serving framework designed to orchestrate large language model (LLM) inference across multi-node GPU clusters. Built primarily in Rust, with Go for deployment infrastructure (Kubernetes operator, API server), and Python for extensibility, it represents a new class of infrastructure software: \emph{AI serving infrastructure}---systems that sit between users and AI models, managing GPU memory, network communication, and request routing to make real-time AI possible at scale.
+
+Dynamo implements several techniques drawn from recent systems research:
+\begin{itemize}
+  \item \textbf{KV-cache-aware routing}: A radix tree tracks which key-value cache blocks are stored on which GPUs, enabling the router to maximize cache reuse and avoid redundant computation.
+  \item \textbf{Disaggregated serving}: Prefill (compute-heavy prompt processing) and decode (memory-heavy token generation) run on separate, independently scaled GPU pools.
+  \item \textbf{Continuous batching}: Requests enter and exit the GPU's processing batch at the granularity of individual iterations rather than waiting for a full batch to complete.
+  \item \textbf{Custom binary protocols}: A zero-copy TCP codec handles all inter-service communication with a 24-byte fixed preamble followed by variable-length header and body payloads.
+\end{itemize}
+
+
+\section{The Language: Why Rust}
+
+Dynamo's performance-critical infrastructure---the binary codec, the radix tree, the router, the frontend HTTP server---is written in Rust.\footnote{Rust comprises roughly 55\% of the Dynamo codebase by lines of code, with Python at $\sim$27\% and Go at $\sim$12\%.} This is not incidental. Rust was designed for exactly this class of problem: high-throughput, low-latency network services where both performance and correctness are non-negotiable.
+
+\begin{notebox}
+If you are not familiar with Rust, you can safely skim this section on first reading. The concepts introduced here---ownership, \texttt{RefCell}, traits---will be revisited in context when they appear in later chapters. The key takeaway is that Rust provides memory safety and high performance without garbage collection, which is essential for a latency-sensitive system like Dynamo.
+\end{notebox}
+
+\subsection{Why Rust for Inference Serving}
+
+Three properties make Rust particularly well-suited to inference infrastructure:
+
+\textbf{Memory safety without a garbage collector.}\hspace{1em} Inference serving must deliver tokens with consistent, low tail latency. A garbage-collected runtime (Java, Go) introduces unpredictable pauses: the GC can halt all threads for milliseconds while it reclaims memory. Python avoids stop-the-world collection through reference counting, but still incurs non-deterministic overhead from cycle collection and the global interpreter lock. At Dynamo's throughput targets---thousands of concurrent requests, each generating tokens every few milliseconds---even a brief GC pause cascades into visible user-facing latency spikes. Discord famously migrated its Read States service from Go to Rust precisely to eliminate such spikes. Rust's \emph{ownership system} guarantees memory safety at \emph{compile time}, with zero runtime overhead: no GC pauses, no reference counting on the hot path, no stop-the-world collection.
+
+\textbf{Fearless concurrency.}\hspace{1em} Dynamo orchestrates hundreds of GPU workers with concurrent requests flowing through routers, codecs, and parsers. Rust's ownership system extends to concurrency: the compiler prevents \emph{data races at compile time}. If two threads need shared access to data, the type system forces the use of synchronization primitives (\texttt{Mutex}, \texttt{RwLock}, \texttt{Arc}). Code that accidentally shares mutable state across threads simply will not compile. For a serving system where a data race in routing logic could silently misroute requests to the wrong GPU, this compile-time guarantee is invaluable.
+
+\textbf{C/C++-class performance.}\hspace{1em} Rust uses the same LLVM backend as Clang and achieves performance within single-digit percentage points of C++ on computational workloads. It achieves this through \emph{zero-cost abstractions}: iterators, closures, and generics all compile to the same machine code as hand-written loops and specialized functions. The principle, borrowed from C++, is: ``What you don't use, you don't pay for. What you do use, you couldn't hand-code any better.'' For Dynamo, this means the \texttt{TwoPartCodec} that decodes every inter-service TCP message runs at the speed of hand-tuned C, but with memory safety guaranteed by the compiler.
+
+\begin{notebox}
+Rust's adoption in performance-critical infrastructure is well-established. AWS Firecracker (which powers Lambda) is written in Rust and starts microVMs in under 125\,ms. Cloudflare's Pingora, a Rust rewrite of their NGINX-based proxy, serves over a trillion requests daily with 70\% less CPU and 67\% less memory than the NGINX-based system it replaced. In the AI ecosystem specifically, Hugging Face Tokenizers (Rust core, Python bindings) achieves a 43$\times$ speedup over its pure-Python predecessor.
+\end{notebox}
+
+
+\subsection{Rust Concepts for This Guide}
+
+The remaining chapters reference several Rust-specific concepts. We introduce them briefly here; each will be revisited in context when it appears.
+
+\textbf{Ownership and borrowing.}\hspace{1em} Every value in Rust has exactly one \emph{owner}. When the owner goes out of scope, the value is freed---no garbage collector involved. You can create \emph{references} (borrows) to a value without taking ownership, subject to one rule: you may have either any number of immutable references (\texttt{\&T}) or exactly one mutable reference (\texttt{\&mut T}), but never both simultaneously. The borrow checker enforces this at compile time, preventing dangling pointers and data races with zero runtime cost.
+
+\textbf{Enums and pattern matching.}\hspace{1em} Rust's enums are \emph{algebraic data types}: each variant can carry associated data. The two most important are \texttt{Option<T>} (\texttt{Some(T)} or \texttt{None}, replacing null pointers) and \texttt{Result<T, E>} (\texttt{Ok(T)} or \texttt{Err(E)}, for recoverable errors). The compiler enforces \emph{exhaustive matching}: every variant must be handled. This is pervasive in Dynamo---parsers return \texttt{Result} types, codec decoders return \texttt{Result<Option<...>{}>}, and the \texttt{match} statement dispatches across parser configurations (Chapter~\ref{ch:codecs}).
+
+\textbf{Error handling and panics.}\hspace{1em} Rust has no exceptions. Recoverable errors use \texttt{Result}; the \texttt{?} operator propagates errors concisely. \emph{Unrecoverable} errors trigger a \textbf{panic}: the thread aborts with a backtrace. Panics arise from integer overflow (in debug builds), out-of-bounds indexing, calling \texttt{.unwrap()} on \texttt{None} or \texttt{Err}, division by zero, and explicit \texttt{panic!()} calls. In a server, a panic in a request handler kills the task---or the entire service. Every crash bug in Chapter~\ref{ch:findings} is a panic.
+
+\textbf{Interior mutability.}\hspace{1em} Sometimes you need to mutate data through a shared reference---for instance, updating a data structure node reachable through multiple reference-counted pointers. Rust provides \texttt{RefCell<T>}\footnote{\texttt{Rc<RefCell<T>{}>} provides shared ownership (\texttt{Rc}) with interior mutability (\texttt{RefCell}). The thread-safe equivalent is \texttt{Arc<RwLock<T>{}>}.}, which moves the borrow check from compile time to runtime: \texttt{.borrow()} for shared access, \texttt{.borrow\_mut()} for exclusive access. If the borrowing rules are violated at runtime---for example, taking two mutable borrows on the same cell---\texttt{RefCell} \emph{panics}. This is exactly how Bug~16 (Chapter~\ref{ch:findings}) manifests: the radix tree uses \texttt{Rc<RefCell<RadixBlock>{}>}, and when a node becomes its own child due to hash collisions, a mutable borrow on the parent followed by an immutable borrow on the child panics because they are the same \texttt{RefCell}.
+
+\textbf{Traits.}\hspace{1em} Rust's mechanism for polymorphism. A trait defines a set of methods that types must implement---similar to interfaces in other languages. Dynamo's reasoning parsers all implement a single \texttt{ReasoningParser} trait (Chapter~\ref{ch:codecs}), allowing the system to dispatch to any of eleven parser variants through a uniform interface.
+
+
+\subsection{What Rust Does and Does Not Prevent}
+
+This distinction is fundamental to the fuzzing campaign in Chapters~\ref{ch:fuzzing}--\ref{ch:findings}:
+\begin{itemize}
+  \item \textbf{Rust prevents}: buffer overflows, use-after-free, double-free, dangling pointers, data races, and null pointer dereferences. These are enforced by the compiler in safe code. The traditional targets of memory-corruption fuzzing largely do not exist.
+  \item \textbf{Rust does not prevent}: panics (denial-of-service bugs), logic errors (silent data corruption), \texttt{RefCell} violations (runtime borrow-check panics), or \texttt{Mutex} misuse (deadlocks). These are the bugs our campaign found.
+\end{itemize}
+
+There is one additional subtlety: \textbf{debug vs.\ release divergence}. Rust compiles with integer overflow checks in debug mode (overflow panics) and without them in release mode (overflow wraps silently via two's complement). The same code can crash in debug and produce silently wrong results in release. Bug~18---the critical integer overflow in the network codec (Chapter~\ref{ch:findings})---exploits exactly this divergence.
+
+
+\subsection{The Rust--Python Bridge}
+
+\marginnote{\emph{PyO3 generates Python extension modules from Rust code. The build tool Maturin compiles Rust into Python wheels.}}%
+Dynamo is not a pure Rust system. The GPU inference engines it orchestrates---vLLM, SGLang, TensorRT-LLM---are all Python-first. Model configuration, custom preprocessing, and operator-facing APIs are written in Python. The bridge between the two languages is \textbf{PyO3}, a Rust library that enables bidirectional function calls between Rust and Python with near-zero overhead.
+
+The architectural split is deliberate: Rust handles the \emph{hot path}---network I/O, binary protocol encoding/decoding, data structure operations, request routing---where microsecond latency matters. Python handles the \emph{configuration path}---model loading, inference engine integration, scaling policies---where flexibility matters more than raw speed. This pattern is increasingly common in AI infrastructure: Hugging Face Tokenizers (Rust core, Python API), Polars (Rust DataFrame library with Python bindings), and Pydantic v2 (Rust validation core, 4--50$\times$ faster than the pure-Python v1) all follow the same design.
+
+
+\section{Dynamo in Context: The Inference Runtime Landscape}
+
+Dynamo does not exist in a vacuum. It enters a crowded field of LLM inference runtimes, each approaching the same fundamental problem---serving transformer models fast and efficiently---from a different angle. Understanding where Dynamo sits in this landscape explains both why it exists and why studying it teaches generalizable lessons about the entire category.
+
+\textbf{vLLM}\hspace{1em} is the most widely adopted open-source inference engine. Developed at UC Berkeley, it introduced \textbf{PagedAttention}---the technique that revolutionized KV cache memory management by applying OS-style virtual memory paging to GPU memory (Chapter~\ref{ch:kvcache}). vLLM handles batching, scheduling, and memory management, and can span multiple nodes for tensor and pipeline parallelism. What it does not do, by itself, is manage a \emph{fleet} of independent model replicas across a cluster---routing requests based on cache state, coordinating prefill and decode across separate GPU pools, or performing KV cache transfers between disaggregated workers.
+
+\textbf{SGLang}\hspace{1em} (from LMSYS, a collaboration spanning UC Berkeley, CMU, and others) takes a programming-language approach to LLM serving. Its key contribution is \textbf{RadixAttention}---a radix tree that tracks cached KV blocks at the \emph{token level} to enable prefix sharing across requests. This is the same core idea behind Dynamo's KV-aware routing (Chapter~\ref{ch:kvrouter}), though Dynamo operates at \emph{block granularity} rather than individual tokens, trades some precision for lower overhead, and extends the concept into a fleet-level orchestration layer. SGLang also supports multi-GPU and multi-node serving with distributed RadixAttention, and its Cache-Aware Load Balancer shares DNA with Dynamo's routing logic.
+
+\textbf{TensorRT-LLM}\hspace{1em} is NVIDIA's own high-performance inference library, optimized for NVIDIA GPUs at the kernel level. It provides the fastest raw inference throughput through custom CUDA kernels, quantization support, and hardware-specific optimizations. Like vLLM, it supports multi-node tensor and pipeline parallelism via NCCL, but its focus is on maximizing single-model throughput rather than fleet-level orchestration.
+
+\textbf{Where Dynamo fits.}\hspace{1em} The critical distinction is between an \emph{inference engine} and an \emph{inference orchestrator}. vLLM, SGLang, and TensorRT-LLM are engines: they execute model inference on GPUs and can scale a single model across nodes. Dynamo is an orchestrator: it sits \emph{above} these engines and coordinates a fleet of model replicas. Dynamo uses vLLM, SGLang, or TensorRT-LLM as pluggable backends---each GPU worker runs one of these engines, and Dynamo handles everything else: routing requests to the right replica based on KV cache state, transferring KV caches between disaggregated prefill and decode pools via NIXL, auto-scaling replicas based on latency metrics, and managing service discovery across nodes via etcd or Kubernetes.
+
+\begin{insightbox}
+Think of the distinction this way: vLLM makes one model go fast. Dynamo makes a fleet of models act as one. vLLM decides how to schedule requests \emph{within} a GPU; Dynamo decides which GPU should receive the request in the first place---and it makes that decision based on which GPU already has the relevant computation cached in memory.
+\end{insightbox}
+
+This layered architecture is why Dynamo makes a compelling case study. Its codebase encompasses problems from every level of the stack: low-level binary codecs for inter-service communication, data structures for distributed cache indexing, parsers for extracting structured content from model output, and orchestration logic for routing and scaling. Fuzzing it stress-tests not just one system, but an entire category of infrastructure.
+
+
+\section{Why This Guide Exists}
+
+This guide has two goals. The first is \textbf{pedagogical}: to teach distributed LLM inference from first principles, using Dynamo as a concrete case study. We assume you know how to program and recall basic linear algebra (matrix multiplication), but nothing about transformers, attention, or GPU architecture. Every concept is explained before it is used. If you read this document linearly from Chapter~\ref{ch:transformer} through Chapter~\ref{ch:codecs}, you will understand how a modern LLM serving system works---not just what the components are, but \emph{why} they exist and \emph{how} they compose.
+
+The second goal is \textbf{empirical}: to stress-test the system. We subjected Dynamo's core Rust libraries to a systematic fuzzing campaign---36 fuzz targets, approximately 141 million test executions---and found 16 bugs. Among them:
+\begin{itemize}
+  \item \textbf{7 high severity}: Crash bugs (UTF-8 boundary panics, integer overflow, out-of-bounds access, deadlock) and critical logic bugs (score underreporting, prefix leaks) that affect routing correctness or service availability.
+  \item \textbf{9 medium severity}: Silent data corruption in LLM output parsers (tool call arguments dropped, strings corrupted, streaming mismatches), arithmetic panics on edge-case inputs, and stale caches.
+\end{itemize}
+Of the 16 bugs, 12 were found by fuzzing and 4 by code audit. Two bugs (the TwoPartCodec overflow and the RadixTree score underreporting) were independently fixed upstream before our disclosure. No prior fuzzing infrastructure existed in the Dynamo repository.
+
+
+\section{How to Read This Guide}
+
+The guide is structured as a narrative that builds progressively. Each chapter answers ``but how does \emph{that} work?'' for a concept introduced in the previous chapter:
+
+\begin{description}[style=nextline,leftmargin=0pt]
+  \item[\textbf{Chapter~\ref{ch:transformer}: The Transformer at Inference Time}]
+    What happens inside a single GPU when a model generates a token. Attention, embeddings, the two phases of generation.
+  \item[\textbf{Chapter~\ref{ch:kvcache}: The KV Cache}]
+    The data structure that makes autoregressive generation efficient. Why it dominates GPU memory, how PagedAttention manages it, and why prefix sharing matters.
+  \item[\textbf{Chapter~\ref{ch:distributed}: Distributed Inference}]
+    Why a single GPU is not enough. Tensor parallelism, pipeline parallelism, continuous batching, speculative decoding, and disaggregated serving.
+  \item[\textbf{Chapter~\ref{ch:architecture}: Dynamo Architecture End-to-End}]
+    The full request trace through Dynamo, component by component. Service discovery, communication planes, the Rust-Python bridge.
+  \item[\textbf{Chapter~\ref{ch:kvrouter}: KV-Aware Routing and the Radix Tree}]
+    How Dynamo decides which GPU handles each request. Tries, radix trees, block hashing, the routing cost function, concurrency strategies.
+  \item[\textbf{Chapter~\ref{ch:tokens}: Token Blocks and Memory Management}]
+    How tokens are partitioned into blocks, hashed with positional encoding, and managed through a compile-time type-state lifecycle.
+  \item[\textbf{Chapter~\ref{ch:codecs}: Network Codecs and Output Parsing}]
+    The binary wire format, zero-copy decoding, TCP connection management, and the parser zoo that extracts structured content from raw model output.
+  \item[\textbf{Chapter~\ref{ch:fuzzing}: Fuzzing the System}]
+    What fuzzing is, how coverage-guided fuzzing works, the oracle problem, and the design and execution of our campaign against Dynamo.
+  \item[\textbf{Chapter~\ref{ch:findings}: Findings and Lessons}]
+    The 16 bugs we found, their root causes and fixes, and the methodology lessons about what testing techniques work on what kinds of code.
+\end{description}
+
+Chapters~\ref{ch:transformer}--\ref{ch:codecs} form the architecture half of the guide ($\sim$70\%). Chapters~\ref{ch:fuzzing}--\ref{ch:findings} form the fuzzing half ($\sim$30\%). You can read the architecture chapters independently as a primer on distributed LLM inference. The fuzzing chapters reference the architecture to explain \emph{what} we tested and \emph{why} specific bugs matter.
+
+
+\section{Notation and Conventions}
+
+Throughout this guide, we use the following conventions:
+\begin{itemize}
+  \item \textbf{Code} is set in \texttt{monospace} and uses Rust syntax unless otherwise noted.
+  \item \textbf{Display equations} are always followed by definitions of every variable and constant.
+  \item \textbf{Green boxes} highlight key insights---the ``aha'' moments worth remembering.
+  \item \textbf{Red boxes} describe specific bugs found during the fuzzing campaign.
+  \item \textbf{Blue boxes} contain supplementary notes and context.
+  \item \marginnote{\emph{Like this one.}}\textbf{Margin notes} provide quick definitions on first use and cross-chapter pointers.
+  \item \textbf{Cross-references} use the format ``Chapter X'' or ``Section X.Y'' and are hyperlinked in the PDF.
+\end{itemize}
+
+
+\section{Summary}
+
+This chapter established the context for the rest of the guide:
+\begin{itemize}
+  \item \textbf{Dynamo} is a distributed inference orchestrator that sits above GPU inference engines (vLLM, SGLang, TensorRT-LLM), coordinating request routing, KV cache management, and scaling across a fleet of GPU workers.
+  \item \textbf{Rust} provides memory safety and C-class performance without garbage collection, making it well-suited for the latency-sensitive hot path---but it does not prevent panics, logic errors, or \texttt{RefCell} violations at runtime.
+  \item \textbf{The inference landscape} distinguishes engines (which make one model go fast) from orchestrators (which make a fleet of models act as one); Dynamo occupies the orchestrator layer.
+  \item \textbf{Two goals} drive this guide: pedagogical (teach distributed LLM inference from first principles using Dynamo as a case study) and empirical (stress-test the system with a systematic fuzzing campaign that found 16 bugs).
+\end{itemize}
+
+\bigskip
+\begin{center}\rule{0.5\linewidth}{0.4pt}\end{center}
+\bigskip
+
+Before we can understand any of this machinery, we need to understand what happens inside a single GPU when a model generates a single token.
+
+
+\bigskip
+\noindent\textbf{Check Your Understanding}
+
+\medskip
+\noindent\emph{These questions start with recall and progress to conceptual reasoning. All are answerable from this chapter alone.}
+
+\begin{enumerate}
+  \item What does Dynamo do? In one sentence, describe its role in an LLM serving stack.
+  \item What is the difference between an inference \emph{engine} and an inference \emph{orchestrator}?
+  \item Why does Dynamo use Rust for its hot path rather than Python or Go?
+  \item Rust prevents buffer overflows and data races at compile time. Why, then, did our fuzzing campaign still find 16 bugs? What \emph{classes} of bug does Rust leave on the table?
+  \item Dynamo's radix tree uses \texttt{Rc<RefCell<...>{}>} for shared mutable state, trading a compile-time safety guarantee for a runtime one. This is arguably a design smell---so why might the developers have chosen it anyway? What structural property of a radix tree makes the standard borrow checker insufficient?
+  \item Consider the ``debug vs.\ release divergence'' described in this chapter. Suppose a developer writes a codec that checks \texttt{if header\_len + body\_len > MAX\_SIZE \{ return Err(...) \}}. Explain how this check can \emph{pass} in debug mode and \emph{fail silently} in release mode for the same malicious input---and what the consequences are for a production deployment.
+  \item This chapter describes Dynamo as a \emph{layered} system: Rust hot path, Python configuration, pluggable inference engines underneath. But layering has a cost---every layer boundary is a potential source of bugs (serialization mismatches, version skew, impedance mismatch between type systems). Why is this layered architecture worth the risk? What would go wrong if you tried to build the entire system---router, codec, radix tree, inference engine integration---in a single language?
+  \item The chapter lists the bugs found: 5 by fuzzer only, 10 by code audit only, 3 by both. If Rust already eliminates the traditional targets of fuzzing (buffer overflows, use-after-free), why does fuzzing still find bugs that code audit misses---and vice versa? What is it about each method that gives it access to a different class of bug?
+\end{enumerate}
+
+\bigskip
+\noindent\textbf{Answers}
+
+\begin{enumerate}
+  \item Dynamo is a distributed inference orchestrator that sits above GPU inference engines (vLLM, SGLang, TensorRT-LLM) and coordinates request routing, KV cache management, and scaling across a fleet of GPU workers.
+
+  \item An engine (vLLM, SGLang, TensorRT-LLM) runs model inference on GPUs---it makes one model go fast. An orchestrator (Dynamo) sits above engines and coordinates a fleet of model replicas---it decides \emph{which} GPU receives each request, manages cross-GPU cache state, and handles scaling. The engine optimizes within a GPU; the orchestrator optimizes across GPUs.
+
+  \item Garbage-collected languages (Go, Java, Python) introduce unpredictable pauses when the GC reclaims memory. At Dynamo's throughput targets---thousands of concurrent requests, each generating tokens every few milliseconds---even a brief GC pause cascades into visible latency spikes. Rust's ownership system provides memory safety at compile time with zero runtime overhead: no GC pauses, no reference counting on the hot path.
+
+  \item Rust prevents \emph{memory safety} bugs (buffer overflows, use-after-free, data races, null dereferences). It does \emph{not} prevent: (a) panics---denial-of-service crashes from integer overflow, out-of-bounds indexing, or \texttt{RefCell} violations; (b) logic errors---silent data corruption where the code runs but produces wrong results; (c) debug/release divergence---code that behaves differently depending on the build profile. These are precisely the bug classes our campaign found.
+
+  \item A radix tree is a graph of nodes connected by edges, and operations like insertion, deletion, and prefix matching need to traverse and mutate multiple nodes simultaneously---including parent-child pairs that may share references. Rust's borrow checker requires that mutable access be exclusive, but tree traversal often requires holding a reference to a parent while mutating a child (or vice versa). \texttt{Rc<RefCell>} allows multiple ownership paths to the same node and defers the exclusivity check to runtime. The trade-off is that violations (e.g., a node becoming its own child due to hash collisions) cause a runtime panic instead of a compile error---exactly what Bug~16 demonstrates.
+
+  \item In debug mode, the addition \texttt{header\_len + body\_len} panics on overflow (the program crashes, which is a denial-of-service but at least prevents further damage). In release mode, the same addition silently wraps via two's complement: for example, if both values are near \texttt{u64::MAX / 2}, their sum wraps to a small number, the size check passes, and the codec proceeds with a corrupted length field. The consequence is that release builds silently bypass the security check---the attacker's input is treated as valid, potentially leading to memory corruption or misinterpreted payloads. This is worse than a crash because the system \emph{continues running} with corrupted state.
+
+  \item The layering is worth it because the alternative---a monolingual system---forces you to choose a single set of trade-offs for every component. A pure Rust system would make Python-ecosystem integration (model loading, tokenizer configs, inference engine APIs) painful and slow to iterate on. A pure Python system cannot meet latency requirements on the hot path. A pure Go system sacrifices both the zero-GC latency of Rust and the ML ecosystem of Python. The layered design lets each component use the best tool for its constraints: Rust where microseconds matter, Python where flexibility matters, Go where Kubernetes-native tooling matters. The layer boundaries \emph{are} a source of bugs (the codec, the PyO3 bridge), but those boundaries are narrow and well-defined---a few serialization points rather than the entire codebase. The alternative is a codebase where \emph{every} component pays the tax of the wrong language for its job.
+
+  \item Fuzzing finds bugs that code audit misses because it \emph{generates concrete inputs} that trigger edge cases a human would not think to test---unusual byte sequences, boundary values, malformed structures. The fuzzer does not need to understand the code's intent; it just explores execution paths. Code audit finds bugs that fuzzing misses because it can reason about \emph{semantic correctness}---``this parser drops text after a tool call'' is a logic error that never crashes, so no crash-only oracle would catch it. A human reading the code can see that the specification requires preserving all content, while the implementation silently discards some. Fuzzing excels at finding inputs that violate \emph{implicit} assumptions (division by zero, overflow, unexpected \texttt{None}); audit excels at finding violations of \emph{explicit} specifications that the code silently gets wrong. The overlap (3 bugs found by both) occurs where the bug is both a specification violation \emph{and} triggers observable misbehavior like a crash or divergence from a reference implementation.
+\end{enumerate}
+
+% --- Chapter labels for cross-references ---
+\label{ch:introduction}
