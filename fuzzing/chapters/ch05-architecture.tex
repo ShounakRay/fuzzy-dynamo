@@ -24,7 +24,7 @@ Regardless of whether the client requests \texttt{stream=true} or \texttt{stream
 The validated request is handed to the \textbf{preprocessor} (in \texttt{dynamo-llm}'s \texttt{preprocessor} module). The preprocessor performs two critical transformations:
 
 \begin{enumerate}
-  \item \textbf{Chat template application.} The user's message array (\texttt{[{"role":"user","content":"Hello"}]}) must be converted into the specific prompt format that the model was trained on. Dynamo uses \texttt{minijinja}, a Rust implementation of the Jinja2 template engine, to apply model-specific chat templates. Different models require wildly different formats---Llama uses \texttt{<|begin\_of\_text|>} markers, ChatGLM uses \texttt{[gMASK]<sop>}, and Mistral uses \texttt{[INST]} tags. The template is loaded from the model's configuration at startup.
+  \item \textbf{Chat template application.} The user's message array is converted into the specific prompt format the model was trained on. Dynamo uses \texttt{minijinja}, a Rust Jinja2 engine, to apply model-specific chat templates. Different models require wildly different formats---Llama uses \texttt{<|begin\_of\_text|>} markers, ChatGLM uses \texttt{[gMASK]<sop>}, and Mistral uses \texttt{[INST]} tags. The template is loaded from the model's configuration at startup.
 
   \item \textbf{Tokenization.} The formatted prompt string is tokenized into a sequence of integer token IDs using the \texttt{dynamo-llm} tokenizer module, which wraps the Hugging Face \texttt{tokenizers} library (itself a Rust crate with Python bindings). For models that use OpenAI's encoding, Dynamo falls back to \texttt{tiktoken-rs}. The result is a \texttt{Vec<u32>} of token IDs ready for the model.
 \end{enumerate}
@@ -364,7 +364,8 @@ The cost of the two-language approach is integration complexity---and, as Chapte
 The division is not arbitrary---it follows the performance profile of each operation:
 
 \begin{center}
-\begin{tabular}{llp{7cm}}
+\small
+\begin{tabular}{llp{7.5cm}}
 \toprule
 \textbf{Operation} & \textbf{Language} & \textbf{Rationale} \\
 \midrule
@@ -397,7 +398,8 @@ Dynamo's codebase is organized into Rust library crates (under \texttt{lib/}), P
 \subsection{Rust Crates (\texttt{lib/})}
 
 \begin{center}
-\begin{tabular}{p{3.8cm}p{9cm}}
+\small
+\begin{tabular}{p{3.5cm}p{8.8cm}}
 \toprule
 \textbf{Crate} & \textbf{Role} \\
 \midrule
@@ -408,7 +410,7 @@ Dynamo's codebase is organized into Rust library crates (under \texttt{lib/}), P
 \texttt{dynamo-parsers} & Streaming output parsers for 15+ model families: tool call extraction, JSON/XML parsing, stop-string detection. The subject of Chapter~\ref{ch:findings} \\
 \texttt{dynamo-memory} & GPU and system memory management: CUDA device memory, pinned host memory, NIXL integration, disk storage, NUMA-aware allocation \\
 \texttt{dynamo-config} & Configuration management: environment variable resolution, configuration file parsing \\
-\texttt{dynamo-async-openai} & Fork of the \texttt{async-openai} crate with Dynamo-specific extensions (BYOT---bring your own transport) \\
+\texttt{dynamo-async-openai} & Fork of \texttt{async-openai} with Dynamo extensions (BYOT---bring your own transport) \\
 \texttt{dynamo-mocker} & Mock inference engine for testing: generates deterministic token streams without GPU \\
 \texttt{dynamo-bench} & Benchmarking utilities shared across crates \\
 \texttt{kvbm-*} & Four crates (\texttt{common}, \texttt{kernels}, \texttt{logical}, \texttt{physical}) implementing the KV Block Manager's layered architecture \\
@@ -421,13 +423,14 @@ Dynamo's codebase is organized into Rust library crates (under \texttt{lib/}), P
 \subsection{Python Components (\texttt{components/src/dynamo/})}
 
 \begin{center}
-\begin{tabular}{p{3.2cm}p{9.5cm}}
+\small
+\begin{tabular}{p{3.2cm}p{9cm}}
 \toprule
 \textbf{Component} & \textbf{Role} \\
 \midrule
-\texttt{frontend} & Python frontend service that initializes the Rust HTTP server, configures model endpoints, and manages the lifecycle of the serving pipeline \\
-\texttt{router} & Python router component that configures and starts the Rust KV-aware router with appropriate settings \\
-\texttt{planner} & Auto-scaling planner: monitors latency/throughput metrics and decides when to scale prefill and decode worker pools (both aggregated and disaggregated modes) \\
+\texttt{frontend} & Python frontend service that initializes the Rust HTTP server, configures model endpoints, and manages the serving pipeline lifecycle \\
+\texttt{router} & Python router that configures and starts the Rust KV-aware router \\
+\texttt{planner} & Auto-scaling planner: monitors latency/throughput metrics and decides when to scale prefill and decode worker pools \\
 \texttt{global\_planner} & Cluster-wide planning for multi-model deployments \\
 \texttt{global\_router} & Cluster-wide routing across multiple model deployments \\
 \texttt{vllm} & vLLM engine integration: wraps vLLM's async generation as a Dynamo engine \\
@@ -443,16 +446,17 @@ Dynamo's codebase is organized into Rust library crates (under \texttt{lib/}), P
 \subsection{Deployment Infrastructure (\texttt{deploy/})}
 
 \begin{center}
-\begin{tabular}{p{3.2cm}p{9.5cm}}
+\small
+\begin{tabular}{p{3.2cm}p{9cm}}
 \toprule
 \textbf{Component} & \textbf{Role} \\
 \midrule
 \texttt{helm} & Helm charts for Kubernetes deployment of Dynamo services \\
 \texttt{operator} & Kubernetes operator (Go) for automated deployment and scaling \\
 \texttt{discovery} & Kubernetes-native service discovery integration \\
-\texttt{docker-compose.yml} & Local development deployment with etcd, NATS, and worker containers \\
-\texttt{nats-server.conf} & NATS server configuration (JetStream enabled, memory/file storage limits) \\
-\texttt{observability} & Prometheus, Grafana, and OpenTelemetry configuration for monitoring \\
+\texttt{docker-compose.yml} & Local dev deployment with etcd, NATS, and worker containers \\
+\texttt{nats-server.conf} & NATS config (JetStream enabled, memory/file storage limits) \\
+\texttt{observability} & Prometheus, Grafana, and OpenTelemetry for monitoring \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -512,7 +516,7 @@ The crate dependency structure forms a layered architecture:
 
   \item The \textbf{PyO3 bridge} separates Rust (data plane) from Python (control plane), crossing the boundary per-request with lightweight serialization. The GIL is held only during brief object conversion, not during GPU computation.
 
-  \item Dynamo's \textbf{crate architecture} is layered: \texttt{dynamo-config} $\rightarrow$ \texttt{dynamo-runtime} $\rightarrow$ \texttt{dynamo-kv-router} / \texttt{dynamo-tokens} $\rightarrow$ \texttt{dynamo-llm} $\rightarrow$ \texttt{dynamo-py3}. Each layer has a well-defined responsibility boundary.
+  \item Dynamo's \textbf{crate architecture} is layered:\\ \texttt{dynamo-config} $\rightarrow$ \texttt{dynamo-runtime} $\rightarrow$ \texttt{dynamo-kv-router}\,/\,\texttt{dynamo-tokens} $\rightarrow$ \texttt{dynamo-llm} $\rightarrow$ \texttt{dynamo-py3}.\\ Each layer has a well-defined responsibility boundary.
 
   \item Dynamo is a \textbf{polyglot system}: Rust, Python, Go, and C++ each handle the components best suited to their strengths, with integration complexity concentrated at language boundaries.
 \end{itemize}

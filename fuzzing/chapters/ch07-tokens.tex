@@ -479,7 +479,7 @@ Blocks are now hashed, routed, and cached. But how does the data actually travel
 
   \textit{Answer:} Layer 1 (salt hash) hashes model metadata into a seed, preventing two different models from sharing cache entries for the same prompt. Layer 2 (block hash) hashes the $B$ token IDs within a block using the salt as seed, producing a content fingerprint. Layer 3 (sequence hash) chains each block hash with its parent's sequence hash, folding positional context into the identifier. Without the salt, cross-model pollution is possible. Without the block hash, the system cannot identify content-identical blocks. Without the sequence hash, position-dependent cache entries would be incorrectly shared.
 
-  \item \textbf{What is the purpose of the variable-width mode encoding in \texttt{PositionalSequenceHash}?} Why not use a fixed layout?
+  \item \textbf{What is the purpose of the variable-width mode encoding in \texttt{Positional\-Sequence\-Hash}?} Why not use a fixed layout?
 
   \textit{Answer:} The mode encoding allocates more bits to the local block hash when positions are small (mode 0: 54 bits for LBH) and trades LBH bits for position bits as positions grow (mode 3: 31 bits each). Since most sequences have fewer than 256 blocks, mode 0 applies to the vast majority of blocks, giving near-full 64-bit hash precision. A fixed 31-bit position field would waste 23 bits on every short-sequence block, reducing hash precision and increasing collision probability in the common case.
 

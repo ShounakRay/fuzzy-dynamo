@@ -408,15 +408,15 @@ Division by zero panics in both profiles, but arithmetic overflow only panics in
 
 \begin{enumerate}
 \item In \textbf{debug mode} (how \texttt{cargo-fuzz} runs by default), the overflow is caught as a crash. The fuzzer reports it, the developer sees it, and it gets fixed.
-\item In \textbf{release mode} (how production runs), \texttt{24 + u64::MAX + 1} wraps to \texttt{25}. The \texttt{max\_message\_size} check passes because \texttt{25 < max\_size}. The codec then attempts to parse 25 bytes of data as a message whose header and body lengths claim to total $2^{64}$ bytes---producing garbage output from whatever happens to be in the buffer.
+\item In \textbf{release mode} (how production runs), the expression \texttt{24\,+\,u64::MAX\,+\,1} wraps to \texttt{25}. The size check passes because \texttt{25 < max\_size}. The codec then tries to parse 25~bytes as a message whose header and body lengths claim to total $2^{64}$~bytes---producing garbage from whatever happens to be in the buffer.
 \end{enumerate}
 
 \begin{bugbox}
 \textbf{The security implication}: In release mode, an attacker can bypass the codec's length validation by sending header and body lengths that sum to more than \texttt{usize::MAX}. The wrapped value passes the size check, and the codec processes a truncated buffer as if it were a valid message. Depending on what the downstream consumer does with the garbage output, this could range from a silent data corruption to a more serious exploit.
 \end{bugbox}
 
-\marginnote{\emph{Checked arithmetic:} Rust provides \texttt{checked\_add}, \texttt{checked\_mul}, etc., which return \texttt{None} on overflow instead of panicking or wrapping.}%
-The lesson is clear: any Rust code that performs arithmetic on values from untrusted input---network data, configuration files, inter-process messages---should use checked arithmetic (\texttt{checked\_add}, \texttt{checked\_mul}) or enable overflow checks in the release profile:
+\marginnote{\emph{Checked arithmetic:} \texttt{checked\_add}, \texttt{checked\_mul}, etc.\ return \texttt{None} on overflow instead of panicking or wrapping.}%
+The lesson is clear: any Rust code that performs arithmetic on untrusted input---network data, configuration files, inter-process messages---should use checked arithmetic (\texttt{checked\_add}, \texttt{checked\_mul}) or enable overflow checks in the release profile:
 
 \begin{verbatim}
 # In Cargo.toml:

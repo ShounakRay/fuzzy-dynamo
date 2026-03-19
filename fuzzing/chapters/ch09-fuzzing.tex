@@ -219,7 +219,7 @@ Differential testing compares the outputs of two or more implementations that sh
 
 \subsection{Triple Differential: RadixTree vs.\ PositionalIndexer vs.\ ConcurrentRadixTree}
 
-The \texttt{fuzz\_triple\_differential} target is the most sophisticated harness in the campaign. It maintains three independent implementations of the KV-cache indexer---\texttt{RadixTree}, \texttt{ConcurrentRadixTree}, and \texttt{PositionalIndexer}---and feeds the same sequence of \texttt{Store}, \texttt{Remove}, \texttt{Clear}, and \texttt{Query} operations to all three. After each \texttt{Query}, it asserts that all three return identical overlap scores:
+The \texttt{fuzz\_triple\_differential} target is the most sophisticated harness in the campaign. It maintains three independent implementations of the KV-cache indexer---\texttt{Radix\-Tree}, \texttt{Concurrent\-Radix\-Tree}, and \texttt{Positional\-Indexer}---and feeds the same sequence of \texttt{Store}, \texttt{Remove}, \texttt{Clear}, and \texttt{Query} operations to all three. After each \texttt{Query}, it asserts that all three return identical overlap~scores:
 
 \begin{lstlisting}[language=Rust,caption={Triple differential: three implementations must agree on every query.}]
 let r_radix = radix.find_matches(seq.clone(), false);
@@ -243,7 +243,7 @@ This harness found the RadixTree score underreporting bug: after a specific sequ
 
 \subsection{Streaming vs.\ Oneshot Differential}
 
-The parser differential target (\texttt{fuzz\_differential}) feeds the same text to both the oneshot parser (\texttt{detect\_and\_parse\_reasoning}) and the streaming parser (\texttt{parse\_reasoning\_streaming\_incremental}), comparing their outputs:
+The parser differential target (\texttt{fuzz\_differential}) feeds the same text to both the oneshot parser (\texttt{detect\_and\_parse\_reasoning}) and the streaming parser (\texttt{parse\_reasoning\_streaming\_\allowbreak incremental}), comparing their~outputs:
 
 \begin{lstlisting}[language=Rust,caption={Streaming vs.\ oneshot differential for reasoning parsers.}]
 let mut oneshot = parser_type.get_reasoning_parser();

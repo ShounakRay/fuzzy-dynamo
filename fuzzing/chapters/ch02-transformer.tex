@@ -19,10 +19,11 @@ A neural network cannot operate on raw text. Before a model sees your prompt, ev
 A \emph{tokenizer} splits a string into a sequence of \emph{tokens}---small pieces that the model treats as atomic units. Tokens are not words, and they are not characters. They are sub-word fragments chosen so that common words and patterns get their own token, while rare words are broken into pieces. For example, the word ``unhappiness'' might be split into three tokens: \texttt{["un", "happi", "ness"]}, while the common word ``the'' is a single token.
 
 Every tokenizer has a fixed \emph{vocabulary}\footnote{\textbf{Vocabulary}: the complete set of tokens a model recognizes, typically 32k--128k entries.}---a numbered list of every token the model can recognize. Modern LLMs typically use vocabularies of $V$ tokens (typically $V \in [32{,}000,\; 128{,}000]$). Each token in the vocabulary is assigned a unique integer \emph{token ID} in the range $\{0, 1, \ldots, V-1\}$. We write the tokenization step as a function:
-\begin{equation}
-\text{Tokenize}(s) = [t_1, t_2, \ldots, t_n], \qquad t_i \in \{0, 1, \ldots, V{-}1\}
-\end{equation}
-where $s$ is the input string and $n$ is the number of tokens produced. For example, $\text{Tokenize}(\texttt{"Hello world"}) = [15496, 995]$ gives $n = 2$.
+\begin{align}
+\text{Tokenize}(s) &= [t_1, t_2, \ldots, t_n], \notag\\
+t_i &\in \{0, 1, \ldots, V{-}1\}
+\end{align}
+where $s$ is the input string and $n$ is the number of tokens produced. For example, tokenizing \texttt{"Hello world"} gives $[15496, 995]$, so $n = 2$.
 
 The tokenizer is entirely separate from the neural network. It is a deterministic, rule-based preprocessing step---often using algorithms like Byte Pair Encoding (BPE)---that runs before the model sees any input, and again after the model produces output token IDs that need to be converted back to text.
 
@@ -381,7 +382,11 @@ $\mathbf{W}^Q$ transforms identity into a search criterion: ``I am a verb'' $\to
 
 \textbf{Value projections decouple matching from extraction.}\hspace{1em} Even after we decide that token $i$ should attend heavily to token $j$, a separate question remains: what information should $j$ actually send to $i$? Without $\mathbf{W}^V$, the weighted sum would use $\alpha_{ij} \cdot \mathbf{x}_j$---the same representation that determined relevance would also carry the information payload. This forces a single vector to serve two masters: the features that make ``bank'' \emph{relevant} to ``steep'' (terrain/geography associations, for disambiguation) may differ from the features ``steep'' needs to \emph{extract} from ``bank'' (syntactic role, semantic sense, positional information for downstream layers). Optimizing one objective degrades the other.
 
-$\mathbf{W}^V$ creates a third, independent view of each token. The attention weights $\alpha_{ij} = \text{softmax}\!\left(\mathbf{Q}\mathbf{K}^\top / \sqrt{d_k}\right)_{ij}$ (the $(i,j)$ entry of the softmax output in Eq.~2.11) determine \emph{who} to attend to. The values $\mathbf{v}_j = \mathbf{x}_j \mathbf{W}^V$ determine \emph{what information flows}. These are optimized independently---no interference between objectives.
+$\mathbf{W}^V$ creates a third, independent view of each token. The attention weights
+\[
+\alpha_{ij} = \text{softmax}\!\left(\mathbf{Q}\mathbf{K}^\top / \sqrt{d_k}\right)_{ij}
+\]
+(the $(i,j)$ entry of the softmax output in Eq.~2.11) determine \emph{who} to attend to. The values $\mathbf{v}_j = \mathbf{x}_j \mathbf{W}^V$ determine \emph{what information flows}. These are optimized independently---no interference between objectives.
 
 \textbf{Projections define a learned, low-rank similarity function.}\hspace{1em} Raw dot products compute one fixed geometric relationship: how aligned two vectors are. But ``relevant'' means different things in different contexts---syntactic dependency, coreference, topical similarity, positional proximity. Projections make similarity \emph{learnable}. Expanding the attention score:
 \begin{equation}

@@ -90,8 +90,8 @@ The two wire formats serve different roles in Dynamo's architecture. The \texttt
 \section{The TwoPartCodec}
 \label{sec:codecs:twopart}
 
-\marginnote{\emph{Tokio codec:} Tokio's \texttt{Decoder}/\texttt{Encoder} traits transform byte streams into typed message streams.}%
-With the wire format established, we can now examine the code that reads and writes it. The \texttt{TwoPartCodec} implements Tokio's \texttt{Decoder} and \texttt{Encoder} traits, integrating with Rust's async I/O ecosystem. The core data structure is \texttt{TwoPartMessage}: a pair of \texttt{Bytes} values (header and body) that can be independently empty.
+\marginnote{\emph{Tokio codecs} turn raw byte streams into typed message streams via \texttt{Decoder} and \texttt{Encoder} traits.}%
+With the wire format established, we can examine the code. \texttt{Two\-Part\-Codec} implements Tokio's \texttt{Decoder} and \texttt{Encoder} traits, integrating with Rust's async I/O ecosystem. Its core type is \texttt{Two\-Part\-Message}: a pair of \texttt{Bytes} (header and body) that can be independently empty.
 
 \begin{verbatim}
 pub struct TwoPartMessage {
@@ -126,7 +126,7 @@ The choice of xxHash-64 (\texttt{xxh3\_64} from the \texttt{xxhash-rust} crate) 
 
 The encoder reverses this process: given a \texttt{TwoPartMessage}, it writes the three \texttt{u64} preamble fields followed by the header and body bytes. Checksum computation is conditional: in debug builds, it computes an xxHash-64 over the concatenation of header and body; in release builds, it writes a zero checksum for speed, relying on TCP's own checksumming for integrity.
 
-The \texttt{TwoPartMessage} type also provides convenience constructors for common patterns: \texttt{from\_header()} for control messages with no body, \texttt{from\_data()} for payloads with no routing header, and \texttt{into\_message\_type()} which classifies the message into one of four variants (\texttt{HeaderOnly}, \texttt{DataOnly}, \texttt{HeaderAndData}, \texttt{Empty}) for pattern matching in downstream handlers.
+\texttt{Two\-Part\-Message} also provides convenience constructors: \texttt{from\_header()} for control messages with no body, \texttt{from\_data()} for payloads with no routing header, and \texttt{into\_message\_type()} which classifies the message into four variants (\texttt{Header\-Only}, \texttt{Data\-Only}, \texttt{Header\-And\-Data}, \texttt{Empty}) for downstream pattern matching.
 
 \begin{notebox}
 The codec supports multiple messages concatenated in a single TCP buffer. Tokio's \texttt{FramedRead} adapter calls \texttt{decode()} in a loop until it returns \texttt{Ok(None)}, naturally handling message pipelining. This is important for performance: TCP's Nagle algorithm may coalesce multiple small messages into a single network packet, and the codec must correctly split them apart.
@@ -222,9 +222,9 @@ Why are there so many parsers? Because there is no standard tool-call format. Th
   \item \textbf{Hermes/Llama3/Mistral/Phi4}: JSON-based formats with start/end delimiter tokens (e.g., \texttt{<TOOLCALL>...\allowbreak</TOOLCALL>}).
   \item \textbf{DeepSeek V3}: custom delimiters with Unicode special characters: \texttt{<|tool\_call\_begin|>}.
   \item \textbf{DeepSeek V3.1/V3.2 (DSML)}: ``DeepSeek Markup Language,'' a full XML-like format with Unicode delimiters and typed parameters.
-  \item \textbf{GLM-4.7} (Zhipu AI): XML with nested tags such as \texttt{<tool\_call>}, \texttt{<arg\_key>}, and \texttt{<arg\_value>}.
-  \item \textbf{Kimi K2} (Moonshot AI): section-delimited format with \texttt{<|tool\_call\_begin|>} tokens and \texttt{functions.name:index} identifiers.
-  \item \textbf{XML/Qwen3 Coder}: generic XML with \texttt{<function=name>\allowbreak <parameter=key>value\allowbreak </parameter>\allowbreak </function>}.
+  \item \textbf{GLM-4.7} (Zhipu AI): XML with nested tags such as \texttt{<tool\_call>}, \texttt{<arg\_key>}, \texttt{<arg\_value>}.
+  \item \textbf{Kimi K2} (Moonshot AI): section-delimited format with \texttt{<|tool\_call\_begin|>} tokens and \texttt{functions.\allowbreak name:index} identifiers.
+  \item \textbf{XML/Qwen3 Coder}: generic XML---e.g., \texttt{<function=name>} with nested \texttt{<parameter>} tags.
   \item \textbf{Pythonic}: Python function call syntax---\texttt{[get\_weather(city="SF")]}.
   \item \textbf{Harmony}: an async JSON-based format requiring concurrent processing.
   \item \textbf{MiniMax M2}: yet another JSON variant with model-specific quirks.
@@ -287,9 +287,11 @@ pub trait ReasoningParser: Send + Debug {
 }
 \end{verbatim}
 
-The first method handles one-shot (complete) inputs; the second handles streaming, returning only the \emph{delta} (newly discovered text) for each chunk. The \texttt{ParserResult} struct splits text into \texttt{reasoning\_text} and \texttt{normal\_text}. Implementations include \texttt{BasicReasoningParser} (handles \texttt{<think>...</think>} with configurable delimiters, used by DeepSeek R1, Qwen3, Kimi K2.5, and Mistral), \texttt{GraniteReasoningParser} (natural-language delimiters like ``Here's my thought process:''), \texttt{GptOssReasoningParser} (GPT-compatible reasoning extraction), and \texttt{MiniMaxAppendThinkParser}. The diversity of delimiter styles is remarkable: DeepSeek uses XML tags, Kimi (original) uses Unicode triangular brackets (\texttt{<<think>>}), Mistral uses bracketed tags (\texttt{[THINK]...[/THINK]}), and Granite uses natural English sentences.
+The first method handles one-shot (complete) inputs; the second handles streaming, returning only the \emph{delta} (newly discovered text) for each chunk. The \texttt{Parser\-Result} struct splits text into \texttt{reasoning\_text} and \texttt{normal\_text}.
 
-The \texttt{ReasoningParser} trait is wrapped in a \texttt{ReasoningParserWrapper} that holds a \texttt{Box<dyn ReasoningParser>}, enabling dynamic dispatch. A factory method \texttt{get\_reasoning\_parser\_from\_name()} looks up the parser type by string name from a global \texttt{OnceLock}-backed map and returns the appropriate wrapper. Unknown names fall back to the basic \texttt{<think>...</think>} parser with a warning---a resilient default that prevents misconfiguration from crashing the system.
+Implementations include \texttt{Basic\-Reasoning\-Parser} (handles \texttt{<think>...\allowbreak </think>} with configurable delimiters, used by DeepSeek~R1, Qwen3, Kimi~K2.5, and Mistral), \texttt{Granite\-Reasoning\-Parser} (natural-language delimiters like ``Here's my thought process:''), \texttt{GptOss\-Reasoning\-Parser} (GPT-compatible), and \texttt{MiniMax\-Append\-Think\-Parser}. The diversity of delimiter styles is remarkable: DeepSeek uses XML tags, Kimi~(original) uses Unicode triangular brackets, Mistral uses \texttt{[THINK]...[/THINK]}, and Granite uses natural English sentences.
+
+The \texttt{Reasoning\-Parser} trait is wrapped in a \texttt{Reasoning\-Parser\-Wrapper} that holds a \texttt{Box<dyn Reasoning\-Parser>}, enabling dynamic dispatch. A factory method looks up the parser type by string name from a global \texttt{OnceLock}-backed map and returns the appropriate wrapper. Unknown names fall back to the basic \texttt{<think>...</think>} parser with a warning---a resilient default that prevents misconfiguration from crashing the system.
 
 \begin{notebox}
 The parser zoo currently maps 17 named parsers to 9 distinct implementations. Several models share implementations: Nemotron Nano reuses Qwen3 Coder's parser, GLM-4.5 reuses the basic \texttt{<think>} parser. The \texttt{OnceLock}-based global map means these mappings are established once and cached for the process lifetime---which becomes a source of bugs when the mapping depends on runtime configuration (see Bug~\#11, the Kimi K2 \texttt{OnceLock} caching issue).

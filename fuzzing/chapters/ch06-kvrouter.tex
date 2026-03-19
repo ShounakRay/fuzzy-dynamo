@@ -435,7 +435,7 @@ pub struct SchedulingRequest {
 }
 \end{verbatim}
 
-The \texttt{overlaps} field comes from the indexer's \texttt{find\_matches}. The \texttt{decode\_blocks} and \texttt{prefill\_tokens} fields come from the active sequence tracker, which monitors in-flight requests. The optional \texttt{allowed\_worker\_ids} enables Endpoint Priority Policies (EPP) to restrict routing to a subset of workers.
+The \texttt{overlaps} field comes from the indexer's \texttt{find\_matches}. The fields \texttt{decode\_blocks} and \texttt{prefill\_tokens} come from the active sequence tracker, which monitors in-flight requests. The optional \texttt{allowed\_\allowbreak worker\_ids} enables Endpoint Priority Policies (EPP) to restrict routing to a subset of workers.
 
 \subsection{The Scoring Formula}
 
@@ -491,7 +491,7 @@ With temperature 0 (the default), the selector \emph{does} pick the best worker 
 Putting it all together, the complete routing path for a new request is:
 
 \begin{enumerate}
-  \item The \texttt{SchedulingRequest} arrives with \texttt{isl\_tokens} (input sequence length), pre-computed \texttt{overlaps} (from the indexer's \texttt{find\_matches}), and per-worker \texttt{decode\_blocks} and \texttt{prefill\_tokens} from the active sequence tracker.
+  \item The \texttt{Scheduling\-Request} arrives with \texttt{isl\_tokens} (input sequence length), pre-computed \texttt{overlaps} from the indexer, and per-worker \texttt{decode\_blocks} and \texttt{prefill\_tokens} from the active sequence tracker.
   \item The selector computes \texttt{request\_blocks = isl\_tokens.div\_ceil(block\_size)}.
   \item For each worker and data-parallel rank, it computes the logit using the formula above.
   \item Softmax sampling selects a candidate (or candidates, in the case of ties at temperature 0).
@@ -523,8 +523,8 @@ These parameters interact in subtle ways. For instance, \texttt{router\_assume\_
   \item A \textbf{radix tree} stores block hashes with per-node worker sets, enabling efficient prefix overlap queries in $O(k)$ time. Each \texttt{RadixBlock} node contains a \texttt{children} map, a \texttt{workers} set, and an optional \texttt{block\_hash}.
   \item \textbf{Block hashing} uses XXH3 to convert token blocks into \texttt{LocalBlockHash} values. \textbf{Sequence hashing} chains blocks into position-aware \texttt{ExternalSequenceBlockHash} values using a rolling hash, ensuring identical tokens at different positions produce different hashes.
   \item The \textbf{cost function} computes a per-worker logit combining prefill cost (inversely related to cache overlap) and decode load, with a tunable \texttt{overlap\_score\_weight}. Selection uses softmax sampling with configurable temperature.
-  \item \textbf{Three indexer implementations} serve different concurrency needs: \texttt{RadixTree} (\texttt{Rc<RefCell>}, single-threaded), \texttt{ConcurrentRadixTree} (\texttt{Arc<RwLock>}, multi-reader), and \texttt{PositionalIndexer} (flat \texttt{DashMap} with jump search, multi-threaded).
-  \item The \texttt{Rc<RefCell>} design trades compile-time safety for runtime borrow checking---a category of bug detectable by fuzzing (Bug~\#2: self-referencing blocks causing \texttt{RefCell} panics or deadlocks).
+  \item \textbf{Three indexer implementations} serve different concurrency needs: \texttt{Radix\-Tree} (single-threaded), \texttt{Concurrent\-Radix\-Tree} (multi-reader), and \texttt{Positional\-Indexer} (multi-threaded, flat hash map with jump search).
+  \item The \texttt{Rc<RefCell>} design trades compile-time safety for runtime borrow checking---a category of bug detectable by fuzzing (Bug~\#2: self-referencing blocks causing \texttt{RefCell} panics or~deadlocks).
   \item The \textbf{DefaultWorkerSelector} orchestrates the full routing decision, from overlap scores through softmax sampling to tree-size tie-breaking.
 \end{itemize}
 
