@@ -95,3 +95,23 @@ doc = false
 name = "fuzz_worker_selector_div"
 path = "fuzz_targets/fuzz_worker_selector_div.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_zmq_wire_decode"
+path = "fuzz_targets/fuzz_zmq_wire_decode.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_zmq_wire_convert"
+path = "fuzz_targets/fuzz_zmq_wire_convert.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_zmq_wire_roundtrip"
+path = "fuzz_targets/fuzz_zmq_wire_roundtrip.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_zmq_wire_extra_keys"
+path = "fuzz_targets/fuzz_zmq_wire_extra_keys.rs"
+doc = false

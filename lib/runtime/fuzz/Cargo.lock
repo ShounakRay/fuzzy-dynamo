@@ -883,6 +883,7 @@ dependencies = [
  "bytes",
  "dynamo-runtime",
  "libfuzzer-sys",
+ "rmp-serde",
  "tokio",
  "tokio-util",
 ]

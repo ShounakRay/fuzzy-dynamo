@@ -12,6 +12,7 @@ libfuzzer-sys = "0.4"
 bytes = "1"
 tokio = { version = "1", features = ["rt", "io-util"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+rmp-serde = "1"
 
 [dependencies.dynamo-runtime]
 path = ".."
@@ -38,4 +39,19 @@ doc = false
 [[bin]]
 name = "fuzz_network_codecs"
 path = "fuzz_targets/fuzz_network_codecs.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_envelope_decode"
+path = "fuzz_targets/fuzz_envelope_decode.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_frame_to_envelope"
+path = "fuzz_targets/fuzz_frame_to_envelope.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_envelope_roundtrip"
+path = "fuzz_targets/fuzz_envelope_roundtrip.rs"
 doc = false
