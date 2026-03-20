@@ -1,0 +1,3 @@
+search<|call_start|>search
+{"query": "test"}
+<|call_end|>

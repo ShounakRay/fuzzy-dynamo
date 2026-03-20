@@ -14,6 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 libfuzzer-sys = "0.4"
 serde_json = "1"
+arbitrary = { version = "1", features = ["derive"] }
 
 [dependencies.dynamo-parsers]
 path = ".."
@@ -28,18 +29,8 @@ path = "fuzz_targets/fuzz_tool_call_parsers.rs"
 doc = false
 
 [[bin]]
-name = "fuzz_parser_configs"
-path = "fuzz_targets/fuzz_parser_configs.rs"
-doc = false
-
-[[bin]]
-name = "fuzz_reasoning_parsers"
-path = "fuzz_targets/fuzz_reasoning_parsers.rs"
-doc = false
-
-[[bin]]
-name = "fuzz_streaming_reasoning"
-path = "fuzz_targets/fuzz_streaming_reasoning.rs"
+name = "fuzz_named_configs"
+path = "fuzz_targets/fuzz_named_configs.rs"
 doc = false
 
 [[bin]]
@@ -53,23 +44,28 @@ path = "fuzz_targets/fuzz_end_positions.rs"
 doc = false
 
 [[bin]]
-name = "fuzz_deepseek_parsers"
-path = "fuzz_targets/fuzz_deepseek_parsers.rs"
+name = "fuzz_deepseek_variants"
+path = "fuzz_targets/fuzz_deepseek_variants.rs"
 doc = false
 
 [[bin]]
-name = "fuzz_structured_configs"
-path = "fuzz_targets/fuzz_structured_configs.rs"
+name = "fuzz_reasoning_oneshot"
+path = "fuzz_targets/fuzz_reasoning_oneshot.rs"
 doc = false
 
 [[bin]]
-name = "fuzz_nested_and_large"
-path = "fuzz_targets/fuzz_nested_and_large.rs"
+name = "fuzz_reasoning_streaming"
+path = "fuzz_targets/fuzz_reasoning_streaming.rs"
 doc = false
 
 [[bin]]
-name = "fuzz_invariants"
-path = "fuzz_targets/fuzz_invariants.rs"
+name = "fuzz_parser_properties"
+path = "fuzz_targets/fuzz_parser_properties.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_parser_semantic"
+path = "fuzz_targets/fuzz_parser_semantic.rs"
 doc = false
 
 [[bin]]
@@ -78,8 +74,13 @@ path = "fuzz_targets/fuzz_differential.rs"
 doc = false
 
 [[bin]]
-name = "fuzz_redos"
-path = "fuzz_targets/fuzz_redos.rs"
+name = "fuzz_parser_stress"
+path = "fuzz_targets/fuzz_parser_stress.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_nested_and_large"
+path = "fuzz_targets/fuzz_nested_and_large.rs"
 doc = false
 
 [[bin]]
@@ -88,16 +89,11 @@ path = "fuzz_targets/fuzz_with_tools.rs"
 doc = false
 
 [[bin]]
-name = "fuzz_content_preservation"
-path = "fuzz_targets/fuzz_content_preservation.rs"
+name = "fuzz_glm47_utf8"
+path = "fuzz_targets/fuzz_glm47_utf8.rs"
 doc = false
 
 [[bin]]
-name = "fuzz_streaming_monotonicity"
-path = "fuzz_targets/fuzz_streaming_monotonicity.rs"
-doc = false
-
-[[bin]]
-name = "fuzz_tool_call_roundtrip"
-path = "fuzz_targets/fuzz_tool_call_roundtrip.rs"
+name = "fuzz_xml_deep"
+path = "fuzz_targets/fuzz_xml_deep.rs"
 doc = false

@@ -1,0 +1,1 @@
+<tool_call>{"name":"test","arguments":{"text":"a &lt; b &amp; c &gt; d &quot;quoted&quot; &apos;apos&apos;"}}</tool_call>

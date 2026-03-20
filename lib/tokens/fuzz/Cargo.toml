@@ -9,6 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
 
 [dependencies.dynamo-tokens]
 path = ".."
@@ -18,16 +19,16 @@ path = ".."
 members = ["."]
 
 [[bin]]
-name = "fuzz_positional_sequence_hash"
-path = "fuzz_targets/fuzz_positional_sequence_hash.rs"
-doc = false
-
-[[bin]]
-name = "fuzz_positional_lineage_hash"
-path = "fuzz_targets/fuzz_positional_lineage_hash.rs"
+name = "fuzz_positional_hash"
+path = "fuzz_targets/fuzz_positional_hash.rs"
 doc = false
 
 [[bin]]
 name = "fuzz_token_block_sequence"
 path = "fuzz_targets/fuzz_token_block_sequence.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_lineage_hash"
+path = "fuzz_targets/fuzz_lineage_hash.rs"
 doc = false

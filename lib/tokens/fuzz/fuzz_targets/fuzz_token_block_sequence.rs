@@ -1,74 +1,80 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
+use arbitrary::Arbitrary;
 
 use dynamo_tokens::TokenBlockSequence;
 
-fuzz_target!(|data: &[u8]| {
-    if data.len() < 3 {
-        return;
-    }
+#[derive(Debug, Arbitrary)]
+enum TokenOp {
+    Append { token: u32 },
+    Pop,
+    Truncate { len: u16 },
+    Unwind { count: u8 },
+    Reset,
+    Extend { tokens: Vec<u32> },
+}
 
-    let block_size = (data[0] % 16) as u32 + 1;
-    let salt_hash = (data[1] & 1 != 0).then(|| u64::from_le_bytes([data[1], data.get(2).copied().unwrap_or(0), 0, 0, 0, 0, 0, 0]));
+#[derive(Debug, Arbitrary)]
+struct FuzzInput {
+    block_size: u16,
+    initial_tokens: Vec<u32>,
+    ops: Vec<TokenOp>,
+}
 
-    let initial_tokens: Vec<u32> = data[2..].chunks(2)
-        .map(|c| (c.get(1).copied().unwrap_or(0) as u32) << 8 | c[0] as u32)
-        .collect();
-    if initial_tokens.len() > 256 {
-        return;
-    }
+fuzz_target!(|input: FuzzInput| {
+    let block_size = (input.block_size % 16).max(1) as u32;
+    let initial_tokens: Vec<u32> = input.initial_tokens.iter().take(256).copied().collect();
+    let ops = if input.ops.len() > 128 { &input.ops[..128] } else { &input.ops };
 
-    let mut seq = TokenBlockSequence::from_slice(&initial_tokens, block_size, salt_hash);
-    assert_eq!(seq.total_tokens(), initial_tokens.len());
+    let mut seq = TokenBlockSequence::from_slice(&initial_tokens, block_size, None);
+    let mut expected_total = initial_tokens.len();
+    assert_eq!(seq.total_tokens(), expected_total);
 
-    let ops_data = if data.len() > 12 { &data[12..] } else { &[] };
-    let mut pos = 0;
-
-    while pos < ops_data.len() {
-        let op = ops_data[pos] % 6;
-        pos += 1;
-        let prev = seq.total_tokens();
-
+    for op in ops {
         match op {
-            0 if pos < ops_data.len() => {
-                let _ = seq.append(ops_data[pos] as u32);
-                pos += 1;
-                assert_eq!(seq.total_tokens(), prev + 1);
+            TokenOp::Append { token } => {
+                let _ = seq.append(*token);
+                expected_total += 1;
+                assert_eq!(seq.total_tokens(), expected_total);
             }
-            1 => {
+            TokenOp::Pop => {
                 let r = seq.pop();
-                if prev > 0 { assert!(r.is_some()); assert_eq!(seq.total_tokens(), prev - 1); }
-                else { assert!(r.is_none()); }
+                if expected_total > 0 {
+                    assert!(r.is_some());
+                    expected_total -= 1;
+                } else {
+                    assert!(r.is_none());
+                }
+                assert_eq!(seq.total_tokens(), expected_total);
             }
-            2 if pos < ops_data.len() => {
-                let new_len = ops_data[pos] as usize;
-                pos += 1;
-                if new_len <= prev {
+            TokenOp::Truncate { len } => {
+                let new_len = *len as usize;
+                if new_len <= expected_total {
                     let _ = seq.truncate(new_len);
-                    assert_eq!(seq.total_tokens(), new_len);
+                    expected_total = new_len;
+                    assert_eq!(seq.total_tokens(), expected_total);
                 }
             }
-            3 if pos < ops_data.len() => {
-                let count = (ops_data[pos] as usize) % 8;
-                pos += 1;
-                if count <= prev {
-                    let _ = seq.unwind(count);
-                    assert_eq!(seq.total_tokens(), prev - count);
+            TokenOp::Unwind { count } => {
+                let c = *count as usize;
+                if c <= expected_total {
+                    let _ = seq.unwind(c);
+                    expected_total -= c;
+                    assert_eq!(seq.total_tokens(), expected_total);
                 }
             }
-            4 => {
+            TokenOp::Reset => {
                 seq.reset();
-                assert_eq!(seq.total_tokens(), 0);
+                expected_total = 0;
+                assert_eq!(seq.total_tokens(), expected_total);
             }
-            5 if pos + 1 < ops_data.len() => {
-                let count = (ops_data[pos] as usize % 8) + 1;
-                pos += 1;
-                let tokens: Vec<u32> = (0..count).map(|i| ops_data.get(pos + i).copied().unwrap_or(0) as u32).collect();
-                pos += count;
+            TokenOp::Extend { tokens } => {
+                let tokens: Vec<u32> = tokens.iter().take(16).copied().collect();
+                let count = tokens.len();
                 let _ = seq.extend(tokens.into());
-                assert_eq!(seq.total_tokens(), prev + count);
+                expected_total += count;
+                assert_eq!(seq.total_tokens(), expected_total);
             }
-            _ => {}
         }
     }
 });

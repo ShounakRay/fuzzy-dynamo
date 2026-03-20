@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 bytes = "1"
 tokio = { version = "1", features = ["rt", "io-util"] }
+tokio-util = { version = "0.7", features = ["codec"] }
 
 [dependencies.dynamo-runtime]
 path = ".."
@@ -20,21 +21,21 @@ path = ".."
 members = ["."]
 
 [[bin]]
+name = "fuzz_codec_crash_oracle"
+path = "fuzz_targets/fuzz_codec_crash_oracle.rs"
+doc = false
+
+[[bin]]
 name = "fuzz_two_part_roundtrip"
 path = "fuzz_targets/fuzz_two_part_roundtrip.rs"
 doc = false
 
 [[bin]]
-name = "fuzz_two_part_decode"
-path = "fuzz_targets/fuzz_two_part_decode.rs"
+name = "fuzz_slug"
+path = "fuzz_targets/fuzz_slug.rs"
 doc = false
 
 [[bin]]
-name = "fuzz_tcp_decode"
-path = "fuzz_targets/fuzz_tcp_decode.rs"
-doc = false
-
-[[bin]]
-name = "fuzz_frame_decode"
-path = "fuzz_targets/fuzz_frame_decode.rs"
+name = "fuzz_network_codecs"
+path = "fuzz_targets/fuzz_network_codecs.rs"
 doc = false
