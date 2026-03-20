@@ -4,8 +4,8 @@
 # Unified Dockerfile for snapshot-agent and placeholder images.
 #
 # Build targets:
-#   docker build --target agent -t snapshot-agent:latest .
-#   docker build --target placeholder --build-arg BASE_IMAGE=<app-image> -t placeholder:latest .
+#   docker build --platform linux/amd64 --target agent -t snapshot-agent:latest .
+#   docker build --platform linux/amd64 --target placeholder --build-arg BASE_IMAGE=<app-image> -t placeholder:latest .
 #
 # Optional targets for CI:
 #   docker build --target linter .   # Run linting
@@ -16,7 +16,8 @@
 # =============================================================================
 ARG DOCKER_PROXY
 ARG GO_VERSION=1.25
-ARG CRIU_VERSION=v4.2
+ARG CRIU_REPO=https://github.com/dfeigin-nv/criu.git
+ARG CRIU_VERSION=add-aio-and-parallel-memfd
 ARG AGENT_BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:25.11-cuda13.0-devel-ubuntu24.04
 
 # For placeholder target only - this default allows agent builds to succeed,
@@ -74,6 +75,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -ldflags="-w -s
 # =============================================================================
 FROM ubuntu:24.04 AS criu-builder
 
+ARG CRIU_REPO
 ARG CRIU_VERSION
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -97,7 +99,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     uuid-dev \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git clone --branch ${CRIU_VERSION} https://github.com/checkpoint-restore/criu.git /tmp/criu \
+RUN git clone --depth 1 --branch ${CRIU_VERSION} ${CRIU_REPO} /tmp/criu \
     && cd /tmp/criu \
     && make -j$(nproc) \
     && make DESTDIR=/criu-install install-criu install-lib install-cuda_plugin
@@ -108,6 +110,12 @@ RUN git clone https://github.com/NVIDIA/cuda-checkpoint.git /tmp/cuda-checkpoint
 # Stage: Agent - Final snapshot-agent image
 # =============================================================================
 FROM ${AGENT_BASE_IMAGE} AS agent
+
+ARG TARGETARCH=amd64
+
+RUN if [ "${TARGETARCH}" != "amd64" ]; then \
+      echo "ERROR: Dynamo Snapshot requires x86_64 (cuda-checkpoint has no ${TARGETARCH} binary)" >&2; exit 1; \
+    fi
 
 # Install CRIU runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -156,9 +164,14 @@ ENTRYPOINT ["/usr/local/bin/snapshot-agent"]
 FROM ${BASE_IMAGE} AS placeholder
 
 ARG BASE_IMAGE
+ARG TARGETARCH=amd64
 ENV ORIGINAL_BASE_IMAGE=${BASE_IMAGE}
 
 USER root
+
+RUN if [ "${TARGETARCH}" != "amd64" ]; then \
+      echo "ERROR: Dynamo Snapshot requires x86_64 (cuda-checkpoint has no ${TARGETARCH} binary)" >&2; exit 1; \
+    fi
 
 # Install minimal runtime dependencies for CRIU restore (nsrestore runs here via nsenter)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -192,4 +205,3 @@ RUN chmod +x /usr/local/bin/nsrestore
 
 # Create directories
 RUN mkdir -p /checkpoints /var/run/criu /var/criu-work
-

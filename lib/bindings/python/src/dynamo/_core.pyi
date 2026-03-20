@@ -2,17 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
-from typing import (
-    Any,
-    AsyncGenerator,
-    AsyncIterator,
-    Awaitable,
-    Callable,
-    Dict,
-    List,
-    Optional,
-    Tuple,
-)
+import os
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
 
 # Import from specialized modules
 from .prometheus_metrics import RuntimeMetrics as PyRuntimeMetrics
@@ -31,14 +22,14 @@ def get_reasoning_parser_names() -> list[str]:
     """Get list of available reasoning parser names."""
     ...
 
-class JsonLike:
-    """
-    Any PyObject which can be serialized to JSON
-    """
-
+def run_kv_indexer(args: List[str]) -> None:
+    """Run the KV indexer with the given arguments."""
     ...
 
-RequestHandler = Callable[[JsonLike], AsyncGenerator[JsonLike, None]]
+# Any Python object that can be serialized to JSON (dict, list, str, int, etc.)
+JsonLike = Any
+
+RequestHandler = Callable[..., AsyncIterator[JsonLike]]
 
 class DistributedRuntime:
     """
@@ -209,19 +200,35 @@ class Client:
         """
         ...
 
-    async def random(self, request: JsonLike) -> AsyncIterator[JsonLike]:
+    async def random(
+            self,
+            request: JsonLike,
+            annotated: bool | None = True,
+            context: Context | None = None,
+        ) -> AsyncIterator[JsonLike]:
         """
         Pick a random instance of the endpoint and issue the request
         """
         ...
 
-    async def round_robin(self, request: JsonLike) -> AsyncIterator[JsonLike]:
+    async def round_robin(
+            self,
+            request: JsonLike,
+            annotated: bool | None = True,
+            context: Context | None = None,
+        ) -> AsyncIterator[JsonLike]:
         """
         Pick the next instance of the endpoint in a round-robin fashion
         """
         ...
 
-    async def direct(self, request: JsonLike, instance: str) -> AsyncIterator[JsonLike]:
+    async def direct(
+            self,
+            request: JsonLike,
+            instance_id: int,
+            annotated: bool | None = True,
+            context: Context | None = None,
+        ) -> AsyncIterator[JsonLike]:
         """
         Pick a specific instance of the endpoint
         """
@@ -457,8 +464,6 @@ class ModelRuntimeConfig:
     enable_local_indexer: bool
     runtime_data: dict[str, Any]
     tensor_model_config: Any | None
-    data_parallel_size: int
-    data_parallel_start_rank: int
     bootstrap_host: str | None
     bootstrap_port: int | None
 
@@ -779,6 +784,64 @@ class KvEventPublisher:
         """
         ...
 
+
+class FpmEventRelay:
+    """
+    Relay that bridges ForwardPassMetrics from a local raw ZMQ PUB socket
+    (InstrumentedScheduler in EngineCore child process) to the Dynamo event
+    plane with automatic discovery registration.
+    """
+
+    def __init__(
+        self,
+        endpoint: Endpoint,
+        zmq_endpoint: str,
+    ) -> None:
+        """
+        Create a relay.
+
+        Args:
+            endpoint: Dynamo component endpoint (provides runtime + discovery).
+            zmq_endpoint: Local ZMQ PUB address to subscribe to
+                (e.g., "tcp://127.0.0.1:20380").
+        """
+        ...
+
+    def shutdown(self) -> None:
+        """Shut down the relay task."""
+        ...
+
+
+class FpmEventSubscriber:
+    """
+    Subscriber for ForwardPassMetrics from the Dynamo event plane.
+    Auto-discovers engine publishers via the discovery plane.
+    """
+
+    def __init__(self, endpoint: Endpoint) -> None:
+        """
+        Create a subscriber that auto-discovers FPM publishers.
+
+        Args:
+            endpoint: Dynamo component endpoint (provides runtime + discovery).
+        """
+        ...
+
+    def recv(self) -> Optional[bytes]:
+        """
+        Blocking receive of the next message (raw msgspec bytes).
+        Releases the GIL while waiting.
+
+        Returns:
+            Raw msgspec payload, or None if the stream is closed.
+        """
+        ...
+
+    def shutdown(self) -> None:
+        """Shut down the subscriber."""
+        ...
+
+
 class HttpService:
     """
     A HTTP service for dynamo applications.
@@ -1041,9 +1104,10 @@ class KvRouterConfig:
         router_ttl_secs: float = 120.0,
         router_max_tree_size: int = 1048576,
         router_prune_target_ratio: float = 0.8,
-        router_queue_threshold: Optional[float] = None,
+        router_queue_threshold: Optional[float] = 2.0,
         router_event_threads: int = 4,
         router_enable_cache_control: bool = False,
+        router_queue_policy: str = "fcfs",
     ) -> None:
         """
         Create a KV router configuration.
@@ -1068,14 +1132,17 @@ class KvRouterConfig:
             router_ttl_secs: TTL for blocks in seconds when not using KV events (default: 120.0)
             router_max_tree_size: Maximum tree size before pruning (default: 1048576, which is 2^20)
             router_prune_target_ratio: Target size ratio after pruning (default: 0.8)
-            router_queue_threshold: Queue threshold fraction for prefill token capacity (default: None).
-                When set, requests are queued if all workers exceed this fraction of
-                max_num_batched_tokens. Enables priority scheduling via latency_sensitivity hints.
-                If None, queueing is disabled and all requests go directly to the scheduler.
+            router_queue_threshold: Queue threshold fraction for prefill token capacity (default: 2.0).
+                Requests are queued if all workers exceed this fraction of max_num_batched_tokens.
+                Enables priority scheduling via request priority hints.
+                Set to None to disable queueing (all requests go directly to the scheduler).
             router_event_threads: Number of event processing threads (default: 4).
                 When > 1, uses a concurrent radix tree with a thread pool.
             router_enable_cache_control: Enable cache control (PIN with TTL) via the worker's
                 cache_control service mesh endpoint (default: False).
+            router_queue_policy: Scheduling policy for the router queue (default: "fcfs").
+                "fcfs": first-come first-served with priority bumps — optimizes tail TTFT.
+                "wspt": weighted shortest processing time (Smith's rule) — optimizes average TTFT.
         """
         ...
 
@@ -1178,6 +1245,15 @@ async def make_engine(distributed_runtime: DistributedRuntime, args: EntrypointA
 
 async def run_input(runtime: DistributedRuntime, input: str, engine_config: EngineConfig) -> None:
     """Start an engine, connect it to an input, and run until stopped."""
+    ...
+
+def run_mocker_trace_replay(
+    trace_file: str | os.PathLike[str],
+    extra_engine_args: Optional[str | os.PathLike[str]] = None,
+    num_workers: int = 1,
+    replay_concurrency: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Replay a mocker trace file and return the simulation report."""
     ...
 
 class Layer:
@@ -1690,4 +1766,3 @@ class VirtualConnectorClient:
     async def wait(self) -> None:
         """Blocks until there is a new decision to fetch using 'get'"""
         ...
-

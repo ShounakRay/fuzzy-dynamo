@@ -13,6 +13,7 @@ from dynamo.llm import ModelInput
 from dynamo.runtime import DistributedRuntime
 from dynamo.sglang.args import Config
 from dynamo.sglang.health_check import (
+    SglangDisaggHealthCheckPayload,
     SglangHealthCheckPayload,
     SglangPrefillHealthCheckPayload,
 )
@@ -101,7 +102,6 @@ async def init_multimodal_encode_worker(
     ).client()
 
     handler = MultimodalEncodeWorkerHandler(config, pd_worker_client, shutdown_event)
-    await handler.async_init(runtime)
 
     await pd_worker_client.wait_for_instances()
 
@@ -158,9 +158,10 @@ async def init_multimodal_worker(
     else:
         handler = MultimodalWorkerHandler(engine, config, None, shutdown_event)
 
-    await handler.async_init()
-
-    health_check_payload = SglangHealthCheckPayload(engine).to_dict()
+    if config.serving_mode == DisaggregationMode.DECODE:
+        health_check_payload = SglangDisaggHealthCheckPayload(engine).to_dict()
+    else:
+        health_check_payload = SglangHealthCheckPayload(engine).to_dict()
 
     try:
         await generate_endpoint.serve_endpoint(
@@ -198,8 +199,6 @@ async def init_multimodal_prefill_worker(
     handler = MultimodalPrefillWorkerHandler(engine, config, shutdown_event)
 
     shutdown_endpoints[:] = [generate_endpoint]
-
-    await handler.async_init()
 
     health_check_payload = SglangPrefillHealthCheckPayload(engine).to_dict()
 

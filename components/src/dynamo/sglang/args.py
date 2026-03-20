@@ -8,6 +8,7 @@ import os
 import socket
 import sys
 import tempfile
+import warnings
 from argparse import Namespace
 from pathlib import Path
 from typing import Any, Dict, Generator, Optional
@@ -367,6 +368,13 @@ async def parse_args(args: list[str]) -> Config:
     else:
         server_args = ServerArgs.from_cli_args(parsed_args)
 
+    if getattr(server_args, "schedule_low_priority_values_first", False):
+        raise ValueError(
+            "--schedule-low-priority-values-first is not supported in Dynamo's "
+            "SGLang integration. Dynamo normalizes request priority so higher "
+            "values are always higher priority at the API layer."
+        )
+
     # Dynamo's streaming handlers expect disjoint output_ids from SGLang (only new
     # tokens since last output), not cumulative tokens. When stream_output=True,
     # SGLang sends disjoint segments which Dynamo passes through directly.
@@ -374,6 +382,14 @@ async def parse_args(args: list[str]) -> Config:
     server_args.stream_output = True
 
     if dynamo_config.use_sglang_tokenizer:
+        warnings.warn(
+            "--use-sglang-tokenizer is deprecated and will be removed in a future "
+            "release. Use '--dyn-chat-processor sglang' on the frontend instead, "
+            "which provides the same SGLang-native pre/post processing with KV "
+            "router support.",
+            FutureWarning,
+            stacklevel=2,
+        )
         logging.info(
             "Using SGLang's built in tokenizer. Setting skip_tokenizer_init to False"
         )

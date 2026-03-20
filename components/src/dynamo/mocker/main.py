@@ -18,6 +18,7 @@ import uvloop
 
 os.environ.setdefault("DYN_COMPUTE_THREADS", "0")
 
+from dynamo.common.utils.runtime import create_runtime
 from dynamo.llm import (
     EngineType,
     EntrypointArgs,
@@ -26,10 +27,10 @@ from dynamo.llm import (
     make_engine,
     run_input,
 )
-from dynamo.runtime import DistributedRuntime
 from dynamo.runtime.logging import configure_dynamo_logging
 
 from .args import create_temp_engine_args_file, parse_args, resolve_planner_profile_data
+from .replay import run_trace_replay
 from .utils.kv_cache import compute_kv_bytes_per_token
 
 configure_dynamo_logging()
@@ -72,6 +73,33 @@ async def worker():
     while still sharing the same event loop and tokio runtime.
     """
     args = parse_args()
+    profile_data_result = None
+
+    # Offline replay does not need planner profile conversion or runtime setup.
+    if args.trace_file is not None:
+        if args.extra_engine_args:
+            extra_engine_args_path = args.extra_engine_args
+            logger.info(f"Using provided MockEngineArgs from {extra_engine_args_path}")
+        else:
+            extra_engine_args_path = create_temp_engine_args_file(args)
+            logger.info("Created MockEngineArgs from CLI arguments")
+
+        try:
+            run_trace_replay(
+                trace_file=args.trace_file,
+                output_file=args.output_file,
+                extra_engine_args=extra_engine_args_path,
+                num_workers=args.num_workers,
+                replay_concurrency=args.replay_concurrency,
+            )
+            return
+        finally:
+            if not args.extra_engine_args and extra_engine_args_path.exists():
+                try:
+                    extra_engine_args_path.unlink()
+                    logger.debug(f"Cleaned up temporary file {extra_engine_args_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to clean up temporary file: {e}")
 
     # Resolve planner-profile-data: convert profile results dir to NPZ if needed
     profile_data_result = resolve_planner_profile_data(args.planner_profile_data)
@@ -87,25 +115,25 @@ async def worker():
         extra_engine_args_path = create_temp_engine_args_file(args)
         logger.info("Created MockEngineArgs from CLI arguments")
 
-    # Pre-fetch model once to avoid HuggingFace rate limiting when launching many workers
-    if args.num_workers > 1 and args.model_path:
-        await prefetch_model(args.model_path)
-
-    # Auto-compute kv_bytes_per_token from model config if not explicitly set
-    if args.kv_bytes_per_token is None and args.model_path:
-        args.kv_bytes_per_token = compute_kv_bytes_per_token(
-            args.model_path, args.kv_cache_dtype
-        )
-
-    # Inject kv_bytes_per_token into engine args JSON (computed after model prefetch)
-    if args.kv_bytes_per_token is not None and not args.extra_engine_args:
-        with open(extra_engine_args_path) as f:
-            engine_args = json.load(f)
-        engine_args["kv_bytes_per_token"] = args.kv_bytes_per_token
-        with open(extra_engine_args_path, "w") as f:
-            json.dump(engine_args, f, indent=2)
-
     try:
+        # Pre-fetch model once to avoid HuggingFace rate limiting when launching many workers
+        if args.num_workers > 1 and args.model_path:
+            await prefetch_model(args.model_path)
+
+        # Auto-compute kv_bytes_per_token from model config if not explicitly set
+        if args.kv_bytes_per_token is None and args.model_path:
+            args.kv_bytes_per_token = compute_kv_bytes_per_token(
+                args.model_path, args.kv_cache_dtype
+            )
+
+        # Inject kv_bytes_per_token into engine args JSON (computed after model prefetch)
+        if args.kv_bytes_per_token is not None and not args.extra_engine_args:
+            with open(extra_engine_args_path) as f:
+                engine_args = json.load(f)
+            engine_args["kv_bytes_per_token"] = args.kv_bytes_per_token
+            with open(extra_engine_args_path, "w") as f:
+                json.dump(engine_args, f, indent=2)
+
         logger.info(
             f"Launching {args.num_workers} mocker worker(s) with isolated DistributedRuntime instances"
         )
@@ -118,8 +146,8 @@ async def worker():
                 logger.debug(f"Cleaned up temporary file {extra_engine_args_path}")
             except Exception as e:
                 logger.warning(f"Failed to clean up temporary file: {e}")
-
-        del profile_data_result  # Triggers tmpdir cleanup via __del__
+        if profile_data_result is not None:
+            del profile_data_result  # Triggers tmpdir cleanup via __del__
 
 
 def compute_stagger_delay(num_workers: int, stagger_delay: float) -> float:
@@ -193,7 +221,6 @@ async def launch_workers(args: argparse.Namespace, extra_engine_args_path: Path)
     - Independent service registration and stats scraping
     - But still sharing the same tokio runtime (efficient)
     """
-    loop = asyncio.get_running_loop()
     futures = []
     runtimes = []
     per_worker_temp_files: list[Path] = []
@@ -218,17 +245,21 @@ async def launch_workers(args: argparse.Namespace, extra_engine_args_path: Path)
         base_engine_args = json.load(f)
 
     needs_per_worker_args = bool(
-        args.bootstrap_ports_list or args.zmq_kv_events_ports_list
+        args.bootstrap_ports_list
+        or args.zmq_kv_events_ports_list
+        or args.zmq_replay_ports_list
     )
 
     for worker_id in range(args.num_workers):
         logger.info(f"Creating mocker worker {worker_id + 1}/{args.num_workers}")
 
         # Create a separate DistributedRuntime for this worker (on same event loop)
-        runtime = DistributedRuntime(
-            loop,
+
+        runtime, loop = create_runtime(
             args.discovery_backend,
             args.request_plane,
+            args.event_plane,
+            True,  # statically set to True, just determines to enable_nats if event_plane is nats
         )
         runtimes.append(runtime)
 
@@ -242,6 +273,8 @@ async def launch_workers(args: argparse.Namespace, extra_engine_args_path: Path)
                 worker_args["zmq_kv_events_port"] = args.zmq_kv_events_ports_list[
                     worker_id
                 ]
+            if args.zmq_replay_ports_list:
+                worker_args["zmq_replay_port"] = args.zmq_replay_ports_list[worker_id]
             with tempfile.NamedTemporaryFile(
                 mode="w", suffix=".json", delete=False
             ) as tmp:
@@ -261,6 +294,7 @@ async def launch_workers(args: argparse.Namespace, extra_engine_args_path: Path)
             model_path=args.model_path,
             model_name=args.model_name,
             endpoint_id=args.endpoint,
+            context_length=0,
             extra_engine_args=str(worker_engine_args_path),
             runtime_config=runtime_config,
             kv_cache_block_size=kv_cache_block_size,
